@@ -2,7 +2,7 @@
 
 LR-FHSS and conventional LoRa event-driven simulator with **relay support**, built in Python using [SimPy](https://simpy.readthedocs.io/).
 
-The simulator models LR-FHSS frequency-hopping transmissions **and** conventional LoRa transmissions under a unified link abstraction. Nodes can transmit directly to the gateway or through **relay nodes** that receive on one link type and forward on another (e.g. LoRa → LR-FHSS relay).
+The simulator models LR-FHSS frequency-hopping transmissions **and** conventional LoRa transmissions under a unified link abstraction. Nodes broadcast to all receivers (sinks and relays) simultaneously. **Relays are passive listener base stations** that independently decode transmissions and forward them to the sink.
 
 ---
 
@@ -13,13 +13,14 @@ The simulator models LR-FHSS frequency-hopping transmissions **and** conventiona
 | **LR-FHSS simulation** | Fragment-level (header + payload) frequency-hopping with configurable code rates (1/3, 2/3, 1/2, 5/6). |
 | **Conventional LoRa simulation** | Single-fragment packets with SF7-12, BW 125/250/500 kHz, LoRa airtime formula, per-SF sensitivity and minimum SNR checks. |
 | **Unified link abstraction** | `LinkConfig` class configures either link type. A LoRa transmission is treated as a single fragment reusing the same collision machinery. |
-| **Relay nodes** | Any node can be configured as a relay. It listens for transmissions, decodes them locally, and forwards via a (potentially different) link type. |
-| **2D node positioning** | Nodes have (x, y) coordinates. Distance-based path loss is computed automatically. Prepared for 3D extension. |
+| **Passive relay base stations** | `Relay(Base)` — independent base stations that receive, decode, and forward packets. Relays have their own collision tracking (spatial diversity). |
+| **Half-duplex constraint** | Receivers and nodes cannot listen and transmit at the same time. When a relay forwards, all ongoing receptions are cancelled. |
+| **2D node positioning** | Nodes and receivers have (x, y) coordinates. Distance-based path loss is computed per receiver. |
 | **Fading models** | Pluggable: No fading, Rayleigh, Rician, Nakagami-m. |
 | **Traffic models** | Pluggable: Exponential, Uniform, Constant, Two-state Markovian. |
 | **ACRDA receiver** | Successive Interference Cancellation (SIC) window-based decoder. |
 | **Log-distance path loss** | Used for LoRa fragment reception (configurable γ, d₀, Lpl(d₀), σ). |
-| **Deduplication** | When both direct and relay paths succeed, the packet is counted only once. |
+| **Deduplication** | When both direct and relay paths succeed, the packet is counted only once at the sink. |
 
 ---
 
@@ -58,7 +59,7 @@ pip install -e .
 lrfhss/
 ├── __init__.py
 ├── link.py           # LinkConfig, LoRa airtime/sensitivity/SNR tables
-├── lrfhss_core.py    # Fragment, Packet, Node (2D + relay), Base, Traffic, Fading ABCs
+├── lrfhss_core.py    # Fragment, Packet, Node, Base, Relay, Traffic, Fading ABCs
 ├── acrda.py           # ACRDA base station with SIC window
 ├── fading.py          # Rayleigh, Rician, Nakagami-m, No-fading implementations
 ├── traffic.py         # Exponential, Uniform, Constant, Markovian traffic generators
@@ -206,20 +207,26 @@ A collection of fragments representing one transmission. Created via `LinkConfig
 
 ### `Node` ([lrfhss/lrfhss_core.py](lrfhss/lrfhss_core.py))
 
-A network device with 2D `(x, y)` position. Key capabilities:
-
-- **Transmit**: sends packets to the gateway via its configured link type.
-- **Relay**: when `relay_enabled=True`, listens for failed transmissions from other nodes, decodes them locally (distance-based RSSI/SNR check), and forwards a new packet to the gateway using `relay_link_config`.
-- **Half-duplex**: a relay cannot receive while transmitting.
+A network end-device with 2D `(x, y)` position. Broadcasts packets to **all receivers** (sinks and relays) simultaneously. The node has **no knowledge of relays** — it simply transmits fragments, and each receiver independently processes them with its own collision tracking.
 
 ### `Base` ([lrfhss/lrfhss_core.py](lrfhss/lrfhss_core.py))
 
-The gateway receiver. Handles both LR-FHSS and LoRa fragments:
+A base station receiver (type `'sink'`). Handles both LR-FHSS and LoRa fragments:
 
 - **LR-FHSS**: original fading-intensity SNR model.
 - **LoRa**: log-distance path-loss → RSSI/SNR with per-SF sensitivity and minimum SNR requirements.
 - **Collision detection**: per-channel, shared between both link types (separate channel spaces).
 - **Deduplication**: tracks decoded packet IDs to avoid double-counting relay + direct.
+- **Position**: has `(x, y)` coordinates used for distance-based reception checks.
+
+### `Relay` ([lrfhss/lrfhss_core.py](lrfhss/lrfhss_core.py))
+
+A relay base station (extends `Base`, type `'relay'`). Passive listener with independent collision tracking:
+
+- **Receives like a Base**: tracks fragments on its own channels with its own collision state (spatial diversity from the sink).
+- **Auto-forwards**: when `try_decode` succeeds, automatically schedules a forwarding process to the sink.
+- **Half-duplex**: when forwarding starts, all ongoing receptions are cancelled. Cannot listen while transmitting.
+- **New packet**: creates a fresh packet using `forward_link_config` (can be a different link type), preserving the original sender ID.
 
 ### `Settings` ([lrfhss/settings.py](lrfhss/settings.py))
 
@@ -247,23 +254,36 @@ Entry point. Returns `[[success_ratio], [goodput_bytes], [transmitted], [relayed
 ## Relay Architecture
 
 ```
-End-Device (LoRa or LR-FHSS)  ──packet──►  Gateway (Base)
-        │                                       ▲
-        │  (if gateway fails to decode)         │
-        ▼                                       │
-   Relay Node (listening)                       │
-        │                                       │
-  [local decode: RSSI/SNR OK?]                 │
-        │ yes                                   │
-  [creates new packet]                         │
-        │                                       │
-   Relay (LR-FHSS or LoRa)  ──new packet──────┘
+                           ┌──────────────────────┐
+                           │  Node (end-device)    │
+                           │  broadcasts to ALL    │
+                           │  receivers equally    │
+                           └──────┬───────┬────────┘
+                                  │       │
+              same fragments      │       │  same fragments
+              (independent copy)  │       │  (independent copy)
+                                  ▼       ▼
+                          ┌───────────┐ ┌───────────┐
+                          │   Sink    │ │   Relay   │
+                          │  (Base)   │ │  (Base)   │
+                          │  type=    │ │  type=    │
+                          │  'sink'   │ │  'relay'  │
+                          └─────▲─────┘ └─────┬─────┘
+                                │             │
+                                │   decoded?  │
+                                │   yes →     │
+                                │   forward   │
+                                │   new pkt   │
+                                └─────────────┘
 ```
 
-- **LoRa relay**: evaluates the single LoRa fragment. If RSSI/SNR OK at relay distance → forwards.
-- **LR-FHSS relay**: waits for all fragments, runs full decode check (≥1 header + ≥threshold payloads OK at relay distance) → forwards.
-- The relay creates a **new packet** using `relay_link_config`, preserving the original sender ID.
-- Both hops share the **same collision machinery** but on separate channel spaces.
+**Key design principles:**
+
+1. **Passive listening**: relays are base stations that independently capture transmissions as they happen. Nodes have no knowledge of relays.
+2. **Independent collision state**: each receiver (sink and every relay) maintains its own channel lists and collision tracking — spatial diversity is modeled.
+3. **Half-duplex**: when a relay forwards a packet, it cancels all ongoing receptions. While transmitting, incoming fragments are silently dropped.
+4. **Deduplication**: if both the sink and a relay successfully decode the same packet, it is counted only once (tracked by original packet ID).
+5. **Heterogeneous links**: the relay can forward using a different link type than the original (e.g. end-device sends LoRa, relay forwards via LR-FHSS).
 
 ---
 

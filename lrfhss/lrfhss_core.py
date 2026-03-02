@@ -107,7 +107,29 @@ class Packet():
             return self.fragments[self.index_transmission-1]
         except:
             return False
-        
+
+    def clone(self):
+        """Create an independent copy with the same identity.
+
+        The clone shares the same ``id`` and ``node_id`` as the
+        original but has fresh fragments with independent collision
+        and success state.  Used to give each receiver its own
+        tracking state when broadcasting to multiple receivers.
+        """
+        c = object.__new__(Packet)
+        c.id = self.id
+        c.node_id = self.node_id
+        c.index_transmission = 0
+        c.success = 0
+        c.link_type = self.link_type
+        c.channels = list(self.channels)
+        c.fragments = []
+        for f in self.fragments:
+            cf = Fragment(f.type, f.duration, f.channel, c.id,
+                         f.intensity, sf=f.sf, bw=f.bw, cr=f.cr)
+            c.fragments.append(cf)
+        return c
+
 # Instead of grid selection, we consider one grid of obw (usually 35 for EU) channels, as it is faster to simulate and extrapolate the number.
 # Later we can implement the grid selection in case of interest of studying it.
 #    def new_channels(self, obw, fragments):
@@ -133,24 +155,16 @@ class Fading(ABC):
         pass
         
 class Node():
-    """A network node that transmits packets and optionally relays.
+    """A network end-device that transmits packets.
 
     Supports both LR-FHSS and conventional LoRa link types.  Uses 2D
-    ``(x, y)`` positioning; distance to the base station is derived
-    automatically.
+    ``(x, y)`` positioning; distance to each receiver is computed
+    dynamically during transmission.
 
-    Relay mode
-    ----------
-    When ``relay_enabled=True`` the node listens for completed
-    transmissions from other nodes, checks whether it can decode them
-    (distance-based RSSI/SNR + collision), and if so forwards a **new**
-    packet to the gateway using ``relay_link_config``.
-
-    * **LoRa relay** – the single LoRa fragment is evaluated; if OK the
-      relay retransmits immediately.
-    * **LR-FHSS relay** – the relay waits for the *whole* packet
-      (all fragments) and then does a standard decode check
-      (≥1 header + ≥threshold payloads OK at relay distance).
+    The node has **no knowledge of relays**.  It simply broadcasts
+    fragments to all receivers (sinks and relays alike).  Each receiver
+    independently tracks collisions, evaluates reception, and decides
+    whether to decode the packet.
 
     Construction
     ------------
@@ -172,7 +186,6 @@ class Node():
                  fading_generator=None, max_distance=2250,
                  transmission_power=14, *,
                  link_config=None, position=None,
-                 relay_enabled=False, relay_link_config=None,
                  base_position=(0, 0)):
         self.id = id(self)
         self.transmitted = 0
@@ -216,12 +229,6 @@ class Node():
         # -- Initial packet ---------------------------------------------
         self.packet = self._create_packet()
 
-        # -- Relay configuration ----------------------------------------
-        self.relay_enabled = relay_enabled
-        self.relay_link_config = relay_link_config
-        self.relayed = 0
-        self._is_transmitting = False
-
     # -- helpers --------------------------------------------------------
 
     def _create_packet(self):
@@ -245,159 +252,65 @@ class Node():
 
     # -- main transmit process ------------------------------------------
 
-    def transmit(self, env, bs, relays=None):
-        """SimPy process: periodically transmit packets.
+    def transmit(self, env, receivers):
+        """SimPy process: periodically broadcast packets to all receivers.
+
+        Each receiver (sink or relay) receives its own independent
+        clone of every packet, with separate collision tracking.
+        The node is completely unaware of receiver types.
 
         Parameters
         ----------
         env : simpy.Environment
-        bs : Base
-            The gateway / base station receiver.
-        relays : list[Node] or None
-            Nodes with ``relay_enabled=True``.  After each packet
-            completes, eligible relays are offered the packet for
-            forwarding if the base failed to decode it directly.
+        receivers : Base or list[Base]
+            All receivers (sinks and relays).  A single Base is
+            accepted for backward compatibility.
         """
+        if not isinstance(receivers, list):
+            receivers = [receivers]
+
         while True:
             yield env.timeout(self.next_transmission())
-            self._is_transmitting = True
             self.transmitted += 1
-            bs.add_packet(self.packet)
-            next_fragment = self.packet.next()
-            first_payload = 0
-            while next_fragment:
-                if (first_payload == 0
-                        and next_fragment.type == 'payload'):
-                    first_payload = 1
-                    yield env.timeout(self.transceiver_wait)
-                next_fragment.timestamp = env.now
-                bs.check_collision(next_fragment)
-                bs.receive_packet(next_fragment)
-                yield env.timeout(next_fragment.duration)
-                bs.finish_fragment(next_fragment, self.distance,
-                                   self.transmission_power)
-                if self.packet.success == 0:
-                    bs.try_decode(self.packet, env.now)
-                next_fragment = self.packet.next()
-            self._is_transmitting = False
 
-            # -- offer to relays if base could not decode ---------------
-            if relays and self.packet.success == 0:
-                for relay in relays:
-                    if (relay.id != self.id
-                            and relay.relay_enabled
-                            and not relay._is_transmitting):
-                        if relay._can_relay_decode(
-                                self.packet, self, bs):
-                            env.process(
-                                relay._relay_forward(
-                                    env, bs, self.packet, self))
-                            break  # first eligible relay wins
+            # Per-receiver independent packet clones
+            rx_packets = {}
+            for rx in receivers:
+                clone = self.packet.clone()
+                rx.add_packet(clone)
+                rx_packets[rx] = clone
+
+            first_payload = False
+            for frag_idx, master_frag in enumerate(
+                    self.packet.fragments):
+                if not first_payload and master_frag.type == 'payload':
+                    first_payload = True
+                    yield env.timeout(self.transceiver_wait)
+
+                # -- fragment start: register at each active receiver --
+                for rx in receivers:
+                    if getattr(rx, '_is_transmitting', False):
+                        continue
+                    rx_frag = rx_packets[rx].fragments[frag_idx]
+                    rx_frag.timestamp = env.now
+                    rx.check_collision(rx_frag)
+                    rx.receive_packet(rx_frag)
+
+                yield env.timeout(master_frag.duration)
+
+                # -- fragment end: finalize at each active receiver ----
+                for rx in receivers:
+                    if getattr(rx, '_is_transmitting', False):
+                        continue
+                    rx_frag = rx_packets[rx].fragments[frag_idx]
+                    dist = self.distance_to(rx.x, rx.y)
+                    rx.finish_fragment(rx_frag, dist,
+                                       self.transmission_power)
+                    rx_pkt = rx_packets[rx]
+                    if rx_pkt.success == 0:
+                        rx.try_decode(rx_pkt, env.now)
 
             self.end_of_transmission()
-
-    # -- relay: decode check --------------------------------------------
-
-    def _can_relay_decode(self, packet, sender, bs):
-        """Check whether this relay can decode *packet* from *sender*.
-
-        Uses the same physics as ``Base.finish_fragment()`` but
-        evaluated at the relay's position (distance to *sender*).
-        Collision information is reused from the base-station
-        processing — a simplification; in practice collisions may
-        differ spatially.
-        """
-        dist = self.distance_to(sender.x, sender.y)
-        if dist <= 0:
-            dist = 1.0
-
-        if packet.link_type == 'lora':
-            frag = packet.fragments[0]
-            return self._frag_ok_lora(frag, dist,
-                                      sender.transmission_power, bs)
-
-        # LR-FHSS — need ≥1 header + ≥threshold payloads OK
-        h_ok = sum(1 for f in packet.fragments
-                   if f.type == 'header'
-                   and self._frag_ok_lrfhss(f, dist,
-                                             sender.transmission_power,
-                                             bs))
-        p_ok = sum(1 for f in packet.fragments
-                   if f.type == 'payload'
-                   and self._frag_ok_lrfhss(f, dist,
-                                             sender.transmission_power,
-                                             bs))
-        return h_ok > 0 and p_ok >= bs.threshold
-
-    def _frag_ok_lrfhss(self, frag, dist, tx_power, bs):
-        """Would an LR-FHSS fragment succeed at this relay's distance?"""
-        if len(frag.collided) > 0:
-            return False
-        tx_W = 10 ** (tx_power / 10) / 1000
-        sens_W = 10 ** (bs.sensitivity / 10) / 1000
-        snr = (tx_W * (frag.intensity ** 2)) / (dist ** 4)
-        return snr > sens_W
-
-    def _frag_ok_lora(self, frag, dist, tx_power, bs):
-        """Would a LoRa fragment succeed at this relay's distance?"""
-        if len(frag.collided) > 0:
-            return False
-        if dist <= 0:
-            dist = 1.0
-        lpl = (10 * bs.gamma * math.log10(dist / bs.d0)
-               + np.random.normal(bs.lpld0, bs.std))
-        rssi = tx_power - lpl
-        if frag.intensity > 0:
-            rssi += 20.0 * math.log10(frag.intensity)
-        noise_floor = -174.0 + 10.0 * np.log10(frag.bw * 1e3)
-        snr_db = rssi - noise_floor
-        return (rssi > lora_sensitivity(frag.sf, frag.bw)
-                and snr_db > lora_min_snr(frag.sf))
-
-    # -- relay: forward -------------------------------------------------
-
-    def _relay_forward(self, env, bs, original_packet, sender):
-        """SimPy process: retransmit a decoded packet to the gateway.
-
-        Creates a brand-new packet using ``relay_link_config`` and
-        transmits it to the base station.  The forwarded packet carries
-        the original sender's ``node_id`` so the base credits the right
-        device.  An ``original_packet_id`` tag prevents the base from
-        double-counting if the direct path also succeeds later (e.g.
-        ACRDA SIC).
-        """
-        self._is_transmitting = True
-
-        # Small processing / turnaround delay
-        yield env.timeout(0.001)
-
-        fwd_packet = Packet(original_packet.node_id,
-                            fading_generator=self.fading_generator,
-                            link_config=self.relay_link_config)
-        fwd_packet.original_packet_id = original_packet.id
-
-        bs.add_packet(fwd_packet)
-        next_fragment = fwd_packet.next()
-        first_payload = 0
-        tw = (self.relay_link_config.transceiver_wait
-              if self.relay_link_config.link_type == 'lrfhss' else 0)
-        while next_fragment:
-            if (first_payload == 0
-                    and next_fragment.type == 'payload'):
-                first_payload = 1
-                yield env.timeout(tw)
-            next_fragment.timestamp = env.now
-            bs.check_collision(next_fragment)
-            bs.receive_packet(next_fragment)
-            yield env.timeout(next_fragment.duration)
-            bs.finish_fragment(next_fragment, self.distance,
-                               self.transmission_power)
-            if fwd_packet.success == 0:
-                bs.try_decode(fwd_packet, env.now)
-            next_fragment = fwd_packet.next()
-
-        self.relayed += 1
-        self._is_transmitting = False
 
 class Base():
     """Gateway / base station receiver.
@@ -427,7 +340,7 @@ class Base():
     """
     def __init__(self, obw, threshold, sensitivity, *,
                  lora_channels=0, gamma=2.32, d0=1000.0,
-                 lpld0=128.95, std=7.8):
+                 lpld0=128.95, std=7.8, position=(0, 0)):
         self.id = id(self)
         self.obw = obw
         self.lora_channels = lora_channels
@@ -442,6 +355,9 @@ class Base():
         self.decoded_packets = set()  # Track decoded packet IDs (dedup)
         self.threshold = threshold
         self.sensitivity = sensitivity
+        # 2D position (used for distance computation by Node.transmit)
+        self.x, self.y = position
+        self.base_type = 'sink'
         # Log-distance path-loss parameters (used for LoRa fragments)
         self.gamma = gamma
         self.d0 = d0
@@ -466,8 +382,16 @@ class Base():
         For LR-FHSS fragments: uses the existing fading-intensity SNR model.
         For LoRa fragments: uses log-distance path-loss -> RSSI/SNR checks
         with per-SF sensitivity and minimum SNR requirements.
+
+        If the fragment was cancelled (e.g. half-duplex clear), this
+        method returns early and marks it as transmitted but failed.
         """
-        self.transmitting[fragment.channel].remove(fragment)
+        # Safety: fragment may have been cleared by half-duplex cancel
+        ch_list = self.transmitting.get(fragment.channel, [])
+        if fragment not in ch_list:
+            fragment.transmitted = 1
+            return
+        ch_list.remove(fragment)
 
         if fragment.type == 'lora':
             # --- Conventional LoRa reception check ---
@@ -569,3 +493,128 @@ class Base():
                 self.packets_received[packet.node_id] += 1
             return True
         return False
+
+
+class Relay(Base):
+    """Relay base station — passive listener that forwards decoded packets.
+
+    A Relay extends :class:`Base` so it receives and tracks fragments on
+    its own channels with independent collision state, exactly like a
+    sink.  When ``try_decode`` succeeds, the relay automatically
+    schedules a forwarding process that retransmits the packet to the
+    sink using ``forward_link_config``.
+
+    Half-duplex constraint
+    ----------------------
+    A relay cannot listen and transmit at the same time.  When
+    forwarding starts, **all ongoing receptions are cancelled**
+    (channels are cleared).  While the relay is transmitting, incoming
+    fragments from other nodes are silently dropped (checked in
+    ``Node.transmit()`` via ``_is_transmitting``).
+
+    Parameters
+    ----------
+    obw : int
+        Number of LR-FHSS channels.
+    threshold : int
+        Minimum payload fragments for LR-FHSS decode.
+    sensitivity : float
+        Receiver sensitivity (dBm).
+    position : tuple (x, y)
+        2D position of the relay.
+    forward_link_config : LinkConfig
+        Link configuration used when forwarding to the sink.
+    fading_generator : Fading
+        Fading model used for forwarded-packet fragment generation.
+    transmission_power : float
+        Transmit power in dBm for forwarded packets.
+    lora_channels, gamma, d0, lpld0, std :
+        Inherited path-loss parameters (see :class:`Base`).
+    """
+
+    def __init__(self, obw, threshold, sensitivity, *,
+                 position, forward_link_config, fading_generator,
+                 transmission_power=14,
+                 lora_channels=0, gamma=2.32, d0=1000.0,
+                 lpld0=128.95, std=7.8):
+        super().__init__(obw, threshold, sensitivity,
+                         lora_channels=lora_channels, gamma=gamma,
+                         d0=d0, lpld0=lpld0, std=std,
+                         position=position)
+        self.base_type = 'relay'
+        self.forward_link_config = forward_link_config
+        self.fading_generator = fading_generator
+        self.transmission_power = transmission_power
+        self.relayed = 0
+        self._is_transmitting = False
+        # Set by run.py before simulation starts
+        self.env = None
+        self.sink = None
+
+    # -- override try_decode to trigger forwarding ----------------------
+
+    def try_decode(self, packet, now):
+        """Decode and, on success, schedule forwarding to the sink."""
+        decoded = super().try_decode(packet, now)
+        if decoded and self.env is not None and self.sink is not None:
+            self.env.process(self._forward(packet))
+        return decoded
+
+    # -- half-duplex helpers --------------------------------------------
+
+    def _cancel_receptions(self):
+        """Cancel all ongoing fragment receptions (half-duplex).
+
+        Clears every channel so that any fragments currently being
+        received are lost.  ``Base.finish_fragment`` will detect the
+        missing fragment and mark it as failed.
+        """
+        for ch in self.transmitting:
+            self.transmitting[ch].clear()
+
+    # -- forwarding process ---------------------------------------------
+
+    def _forward(self, original_packet):
+        """SimPy process: retransmit a decoded packet to the sink.
+
+        Creates a new packet using ``forward_link_config`` and sends
+        it through the sink's reception pipeline. The forwarded packet
+        carries the original sender's ``node_id`` so the sink credits
+        the correct device.  An ``original_packet_id`` tag prevents
+        double-counting if the sink also decoded the direct path.
+        """
+        # -- enter transmit mode (half-duplex) --------------------------
+        self._cancel_receptions()
+        self._is_transmitting = True
+
+        # Small processing / turnaround delay
+        yield self.env.timeout(0.001)
+
+        fwd = Packet(original_packet.node_id,
+                     fading_generator=self.fading_generator,
+                     link_config=self.forward_link_config)
+        fwd.original_packet_id = original_packet.id
+
+        self.sink.add_packet(fwd)
+        first_payload = False
+        tw = (self.forward_link_config.transceiver_wait
+              if self.forward_link_config.link_type == 'lrfhss' else 0)
+
+        dist_to_sink = math.sqrt(
+            (self.x - self.sink.x) ** 2 + (self.y - self.sink.y) ** 2)
+
+        for frag in fwd.fragments:
+            if not first_payload and frag.type == 'payload':
+                first_payload = True
+                yield self.env.timeout(tw)
+            frag.timestamp = self.env.now
+            self.sink.check_collision(frag)
+            self.sink.receive_packet(frag)
+            yield self.env.timeout(frag.duration)
+            self.sink.finish_fragment(frag, dist_to_sink,
+                                     self.transmission_power)
+            if fwd.success == 0:
+                self.sink.try_decode(fwd, self.env.now)
+
+        self.relayed += 1
+        self._is_transmitting = False
