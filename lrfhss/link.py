@@ -1,0 +1,298 @@
+"""
+Link configuration module for LR-FHSS and conventional LoRa transmissions.
+
+A Link defines HOW a transmission happens between two points:
+  - 'lrfhss': multiple frequency-hopping fragments (headers + payloads)
+  - 'lora': a single contiguous transmission on one channel
+
+Both link types produce Fragment/Packet objects that share the same
+collision and reception machinery in Base.
+"""
+
+import math
+import numpy as np
+import warnings
+
+
+# ---------------------------------------------------------------------------
+# LoRa receiver sensitivity table (measured values)
+# Rows: SF7..SF12,  Columns: [SF, 125kHz, 250kHz, 500kHz]  (dBm)
+# ---------------------------------------------------------------------------
+_SENSI_TABLE = np.array([
+    [7,  -126.5,  -124.25, -120.75],
+    [8,  -127.25, -126.75, -124.0],
+    [9,  -131.25, -128.25, -127.5],
+    [10, -132.75, -130.25, -128.75],
+    [11, -134.5,  -132.75, -128.75],
+    [12, -133.25, -132.25, -132.25],
+])
+
+# Minimum SNR (dB) required for demodulation at each SF (SF7..SF12)
+_SNR_REQ = np.array([-7.5, -10.0, -12.5, -15.0, -17.5, -20.0])
+
+# EU868 LoRa carrier frequencies (Hz)
+LORA_CARRIER_FREQUENCIES = np.array([
+    867_100_000, 867_300_000, 867_500_000, 867_700_000,
+    867_900_000, 868_100_000, 868_300_000, 868_500_000,
+])
+
+
+# ---------------------------------------------------------------------------
+# LoRa PHY helper functions
+# ---------------------------------------------------------------------------
+
+def lora_sensitivity(sf: int, bw: int) -> float:
+    """Return receiver sensitivity (dBm) for a given SF and bandwidth (kHz).
+
+    Parameters
+    ----------
+    sf : int
+        Spreading factor (7-12).
+    bw : int
+        Bandwidth in kHz (125, 250 or 500).
+
+    Returns
+    -------
+    float
+        Sensitivity threshold in dBm.
+    """
+    bw_col = {125: 1, 250: 2, 500: 3}
+    if sf < 7 or sf > 12:
+        raise ValueError(f"SF must be 7-12, got {sf}")
+    if bw not in bw_col:
+        raise ValueError(f"BW must be 125, 250, or 500 kHz, got {bw}")
+    return float(_SENSI_TABLE[sf - 7, bw_col[bw]])
+
+
+def lora_min_snr(sf: int) -> float:
+    """Return minimum SNR (dB) required for demodulation at a given SF.
+
+    Parameters
+    ----------
+    sf : int
+        Spreading factor (7-12).
+
+    Returns
+    -------
+    float
+        Minimum required SNR in dB.
+    """
+    if sf < 7 or sf > 12:
+        raise ValueError(f"SF must be 7-12, got {sf}")
+    return float(_SNR_REQ[sf - 7])
+
+
+def lora_airtime(sf: int, cr: int, payload_size: int, bw: int) -> float:
+    """Compute conventional LoRa packet airtime **in seconds**.
+
+    Implements the formula from the LoRa Design Guide (Semtech).
+
+    Parameters
+    ----------
+    sf : int
+        Spreading factor (7-12).
+    cr : int
+        Coding rate denominator minus 4, i.e. 1 for 4/5, 2 for 4/6,
+        3 for 4/7, 4 for 4/8.
+    payload_size : int
+        Application payload size in bytes.
+    bw : int
+        Bandwidth in kHz (125, 250, 500).
+
+    Returns
+    -------
+    float
+        Total airtime in **seconds**.
+    """
+    H = 0   # implicit header disabled (0) or enabled (1)
+    DE = 0  # low data-rate optimization
+
+    if bw == 125 and sf in (11, 12):
+        DE = 1  # mandated for BW125 with SF11/SF12
+    if sf == 6:
+        H = 1   # implicit header required for SF6
+
+    Npream = 8  # preamble symbols
+
+    Tsym = (2.0 ** sf) / bw                         # ms per symbol
+    Tpream = (Npream + 4.25) * Tsym                  # ms
+
+    payload_symb = 8 + max(
+        math.ceil((8.0 * payload_size - 4.0 * sf + 28 + 16 - 20 * H)
+                  / (4.0 * (sf - 2 * DE))) * (cr + 4),
+        0,
+    )
+    Tpayload = payload_symb * Tsym                   # ms
+
+    return (Tpream + Tpayload) / 1000.0              # convert ms -> seconds
+
+
+def lora_energy(tx_power_dbm: float, airtime_s: float) -> float:
+    """Compute transmission energy in Joules.
+
+    Parameters
+    ----------
+    tx_power_dbm : float
+        Transmit power in dBm.
+    airtime_s : float
+        Airtime in seconds.
+
+    Returns
+    -------
+    float
+        Energy in Joules.
+    """
+    tx_power_w = 10.0 ** (tx_power_dbm / 10.0) / 1000.0
+    return tx_power_w * airtime_s
+
+
+# ---------------------------------------------------------------------------
+# LinkConfig
+# ---------------------------------------------------------------------------
+
+class LinkConfig:
+    """Encapsulates all parameters that define a link type.
+
+    Parameters
+    ----------
+    link_type : str
+        ``'lrfhss'`` or ``'lora'``.
+
+    LR-FHSS specific (ignored when link_type='lora'):
+        headers, header_duration, payload_duration, transceiver_wait,
+        code, obw, payloads, threshold.
+
+    LoRa specific (ignored when link_type='lrfhss'):
+        sf, bw, cr, lora_channels.
+
+    Common:
+        payload_size, sensitivity, transmission_power.
+    """
+
+    def __init__(
+        self,
+        link_type: str = 'lrfhss',
+        # --- common ---
+        payload_size: int = 10,
+        sensitivity: float = -120.0,
+        transmission_power: float = 14.0,
+        # --- LR-FHSS specific ---
+        headers: int = 3,
+        header_duration: float = 0.233472,
+        payload_duration: float = 0.1024,
+        transceiver_wait: float = 0.006472,
+        code: str = '1/3',
+        obw: int = 35,
+        payloads: int = None,
+        threshold: int = None,
+        # --- LoRa specific ---
+        sf: int = 9,
+        bw: int = 125,
+        cr: int = 1,
+        lora_channels: int = 8,
+    ):
+        self.link_type = link_type.lower()
+        if self.link_type not in ('lrfhss', 'lora'):
+            raise ValueError(f"link_type must be 'lrfhss' or 'lora', got '{link_type}'")
+
+        # Common
+        self.payload_size = payload_size
+        self.sensitivity = sensitivity
+        self.transmission_power = transmission_power
+
+        if self.link_type == 'lrfhss':
+            self._init_lrfhss(headers, header_duration, payload_duration,
+                              transceiver_wait, code, obw, payloads, threshold,
+                              payload_size)
+        else:
+            self._init_lora(sf, bw, cr, lora_channels, payload_size)
+
+    # ---- LR-FHSS initialisation ----
+    def _init_lrfhss(self, headers, header_duration, payload_duration,
+                     transceiver_wait, code, obw, payloads, threshold,
+                     payload_size):
+        self.headers = headers
+        self.header_duration = header_duration
+        self.payload_duration = payload_duration
+        self.transceiver_wait = transceiver_wait
+        self.obw = obw
+
+        if payloads is not None:
+            self.payloads = payloads
+        else:
+            self.payloads = self._compute_payloads(code, payload_size)
+
+        if threshold is not None:
+            self.threshold = threshold
+        else:
+            self.threshold = self._compute_threshold(code, self.payloads)
+
+        self.time_on_air = (header_duration * headers
+                            + payload_duration * self.payloads
+                            + transceiver_wait)
+
+        # Not applicable but set for uniform interface
+        self.sf = None
+        self.bw = None
+        self.cr = None
+        self.lora_channels = None
+
+    # ---- LoRa initialisation ----
+    def _init_lora(self, sf, bw, cr, lora_channels, payload_size):
+        self.sf = sf
+        self.bw = bw
+        self.cr = cr
+        self.lora_channels = lora_channels
+
+        self.time_on_air = lora_airtime(sf, cr, payload_size, bw)
+        self.lora_sensitivity = lora_sensitivity(sf, bw)
+        self.lora_min_snr = lora_min_snr(sf)
+
+        # Not applicable but set for uniform interface
+        self.headers = 0
+        self.payloads = 0
+        self.header_duration = 0.0
+        self.payload_duration = 0.0
+        self.transceiver_wait = 0.0
+        self.obw = lora_channels  # channel count used by Packet
+        self.threshold = 0
+
+    # ---- Code-rate helpers (same logic as Settings) ----
+    @staticmethod
+    def _compute_payloads(code: str, payload_size: int) -> int:
+        match code:
+            case '1/3':
+                return int(np.ceil((payload_size + 3) / 2))
+            case '2/3':
+                return int(np.ceil((payload_size + 3) / 4))
+            case '5/6':
+                return int(np.ceil((payload_size + 3) / 5))
+            case '1/2':
+                return int(np.ceil((payload_size + 3) / 3))
+            case _:
+                warnings.warn(f"code='{code}' invalid, using '1/3'.")
+                return int(np.ceil((payload_size + 3) / 2))
+
+    @staticmethod
+    def _compute_threshold(code: str, payloads: int) -> int:
+        match code:
+            case '1/3':
+                return int(np.ceil(payloads / 3))
+            case '2/3':
+                return int(np.ceil((2 * payloads) / 3))
+            case '5/6':
+                return int(np.ceil((5 * payloads) / 6))
+            case '1/2':
+                return int(np.ceil(payloads / 2))
+            case _:
+                return int(np.ceil(payloads / 3))
+
+    def __repr__(self):
+        if self.link_type == 'lrfhss':
+            return (f"LinkConfig(type=lrfhss, headers={self.headers}, "
+                    f"payloads={self.payloads}, threshold={self.threshold}, "
+                    f"obw={self.obw}, ToA={self.time_on_air:.4f}s)")
+        else:
+            return (f"LinkConfig(type=lora, SF={self.sf}, BW={self.bw}kHz, "
+                    f"CR=4/{self.cr+4}, channels={self.lora_channels}, "
+                    f"ToA={self.time_on_air:.4f}s)")

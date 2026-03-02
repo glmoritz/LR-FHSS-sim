@@ -12,6 +12,11 @@ class BaseACRDA(Base):
         self.memory[packet.id] = packet
 
     def try_decode(self,packet,now):
+        # LoRa packets: delegate to the simple single-fragment check
+        if packet.link_type == 'lora':
+            return self._try_decode_lora(packet)
+
+        # LR-FHSS ACRDA decode with SIC
         for f in list(packet.fragments):
             if not self.in_window(f, now):
                 packet.fragments.remove(f)
