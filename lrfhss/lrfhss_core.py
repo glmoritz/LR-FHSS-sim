@@ -226,7 +226,7 @@ class Node():
                  transceiver_wait=0, traffic_generator=None,
                  fading_generator=None, max_distance=2250,
                  transmission_power=14, *,
-                 link_config=None, position=None,
+                 min_distance=0, link_config=None, position=None,
                  base_position=(0, 0), pathloss_model=None):
         self.id = id(self)
         self.transmitted = 0
@@ -285,6 +285,7 @@ class Node():
         """Assign a LinkConfig after construction (e.g. per-node configs).
 
         Updates all packet-creation fields and creates the initial packet.
+        Also picks up the pathloss_model from the new LinkConfig.
         """
         self.link_config = link_config
         self.obw = link_config.obw
@@ -293,6 +294,8 @@ class Node():
         self.header_duration = link_config.header_duration
         self.payload_duration = link_config.payload_duration
         self.transceiver_wait = link_config.transceiver_wait
+        if getattr(link_config, 'pathloss_model', None) is not None:
+            self.pathloss_model = link_config.pathloss_model
         self.packet = self._create_packet()
 
     # -- helpers --------------------------------------------------------
@@ -366,6 +369,7 @@ class Node():
                     # (needed for LoRa inter-SF interference model).
                     rx_frag.rx_distance = self.distance_to(rx.x, rx.y)
                     rx_frag.tx_power = self.transmission_power
+                    rx_frag._pathloss_model = self.pathloss_model
                     rx.check_collision(rx_frag)
                     rx.receive_packet(rx_frag)
 
@@ -447,6 +451,27 @@ class Base():
         """Return a stable dedup key for sink-side packet accounting."""
         pkt_id = getattr(packet, 'original_packet_id', packet.id)
         return (packet.node_id, pkt_id)
+
+    def _compute_lora_rssi(self, fragment, distance, tx_power):
+        """Compute and cache RSSI (dBm) for a LoRa fragment.
+
+        Used by ``_finish_lora_fragment`` to evaluate the SIR against
+        colliding fragments.  Result is stored on the fragment as
+        ``fragment.rssi`` so it is only computed once.
+        """
+        if hasattr(fragment, 'rssi') and fragment.rssi is not None:
+            return fragment.rssi
+        pathloss_model = getattr(fragment, '_pathloss_model', None)
+        if pathloss_model is None:
+            # Fall back: use distance^2 free-space approximation
+            pl = 20.0 * math.log10(max(distance, 1.0)) + 40.0
+        else:
+            pl = pathloss_model.path_loss_db(distance)
+        rssi = tx_power - pl
+        if getattr(fragment, 'intensity', 1) > 0:
+            rssi += 20.0 * math.log10(fragment.intensity)
+        fragment.rssi = rssi
+        return rssi
 
     def add_packet(self, packet):
         pass
@@ -700,8 +725,13 @@ class Relay(Base):
         self.forward_link_config = forward_link_config
         self.fading_generator = fading_generator
         self.transmission_power = transmission_power
+        self.dutycycle_period_s = dutycycle_period_s
+        self.dutycycle_percent = dutycycle_percent
         self.relayed = 0
         self._is_transmitting = False
+        self._is_listening = True
+        self._forward_queue = deque()
+        self._queued_packet_ids = set()
         # Set by run.py before simulation starts
         self.env = None
         self.sink = None
@@ -748,26 +778,27 @@ class Relay(Base):
 
     # -- forwarding process ---------------------------------------------
 
-    def _forward(self, original_packet):
-        """SimPy process: retransmit a decoded packet to the sink.
+    def _forward(self, node_id, original_pkt_id):
+        """SimPy process: retransmit one decoded packet to the sink.
 
         Creates a new packet using ``forward_link_config`` and sends
-        it through the sink's reception pipeline. The forwarded packet
+        it through the sink's reception pipeline.  The forwarded packet
         carries the original sender's ``node_id`` so the sink credits
-        the correct device.  An ``original_packet_id`` tag prevents
-        double-counting if the sink also decoded the direct path.
-        """
-        # -- enter transmit mode (half-duplex) --------------------------
-        self._cancel_receptions()
-        self._is_transmitting = True
+        the correct device.  ``original_pkt_id`` is stored on the
+        forwarded packet to prevent double-counting if the sink also
+        decoded the direct path.
 
+        TX mode (``_is_transmitting = True``) is set by the caller
+        (``_flush_queue`` or ``_dutycycle_loop``) before this process
+        is started.
+        """
         # Small processing / turnaround delay
         yield self.env.timeout(0.001)
 
-        fwd = Packet(original_packet.node_id,
+        fwd = Packet(node_id,
                      fading_generator=self.fading_generator,
                      link_config=self.forward_link_config)
-        fwd.original_packet_id = original_packet.id
+        fwd.original_packet_id = original_pkt_id
 
         self.sink.add_packet(fwd)
         first_payload = False
@@ -794,6 +825,8 @@ class Relay(Base):
                 self.sink.try_decode(fwd, self.env.now)
 
         self.relayed += 1
+        self._is_transmitting = False
+        self._is_listening = True
 
     def _flush_queue(self):
         """Forward buffered packets (used by non-duty-cycle mode)."""
@@ -808,6 +841,8 @@ class Relay(Base):
             node_id, pkt_id = self._forward_queue.popleft()
             yield self.env.process(self._forward(node_id, pkt_id))
             self._queued_packet_ids.discard((node_id, pkt_id))
+            # _forward resets _is_transmitting; re-arm for next packet
+            self._is_transmitting = True
 
         self._is_transmitting = False
         self._is_listening = True

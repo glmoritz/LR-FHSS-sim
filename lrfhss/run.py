@@ -32,9 +32,12 @@ def run_sim(settings: Settings, seed=0):
     base_pos = getattr(settings, 'base_position', (0, 0))
 
     link_config = getattr(settings, 'link_config', None)
+    link_config_is_callable = callable(link_config)
     relay_link_config = getattr(settings, 'relay_link_config', None)
     number_relays = getattr(settings, 'number_relays', 0)
     relay_positions = getattr(settings, 'relay_positions', None)
+    relay_dutycycle_period_s = getattr(settings, 'relay_dutycycle_period_s', None)
+    relay_dutycycle_percent = getattr(settings, 'relay_dutycycle_percent', None)
 
     # ---- Sink (main base station) ----
     if settings.base == 'acrda':
@@ -74,8 +77,7 @@ def run_sim(settings: Settings, seed=0):
             transmission_power=settings.transmission_power,
             dutycycle_period_s=relay_dutycycle_period_s,
             dutycycle_percent=relay_dutycycle_percent,
-            lora_channels=lora_ch, gamma=gamma, d0=d0,
-            lpld0=lpld0, std=std,
+            lora_channels=lora_ch,
         )
         # Bind SimPy env and sink reference for forwarding
         relay.env = env
@@ -98,6 +100,7 @@ def run_sim(settings: Settings, seed=0):
                 transmission_power=settings.transmission_power,
                 link_config=None if link_config_is_callable else link_config,
                 base_position=base_pos,
+                pathloss_model=settings.pathloss_model if not link_config_is_callable else None,
             )
             if link_config_is_callable:
                 node.set_link_config(link_config(node.distance))

@@ -129,12 +129,14 @@ class Settings():
             self.link_config = link_config
             if callable(link_config):
                 # Callable link_config: per-node configs resolved at runtime.
-                # Use legacy params for Base / backward-compat attributes.
+                # Build a representative LR-FHSS config for legacy attribute
+                # exposure and Base construction.
                 _default_lc = LinkConfig(
                     link_type='lrfhss',
                     payload_size=payload_size,
                     sensitivity=sensitivity,
                     transmission_power=transmission_power,
+                    pathloss_model=self.pathloss_model,
                     headers=headers,
                     header_duration=header_duration,
                     payload_duration=payload_duration,
@@ -146,13 +148,17 @@ class Settings():
                 )
             else:
                 _default_lc = link_config
+                # Attach pathloss_model to link_config if not already set
+                if _default_lc.pathloss_model is None:
+                    _default_lc.pathloss_model = self.pathloss_model
         else:
             # Build an LR-FHSS LinkConfig from legacy parameters
-            self.link_config = LinkConfig(
+            _default_lc = LinkConfig(
                 link_type='lrfhss',
                 payload_size=payload_size,
                 sensitivity=sensitivity,
                 transmission_power=transmission_power,
+                pathloss_model=self.pathloss_model,
                 headers=headers,
                 header_duration=header_duration,
                 payload_duration=payload_duration,
@@ -162,28 +168,27 @@ class Settings():
                 payloads=payloads,
                 threshold=threshold,
             )
+            self.link_config = _default_lc
 
-        # Attach pathloss_model to link_config if not already set
-        if self.link_config.pathloss_model is None:
-            self.link_config.pathloss_model = self.pathloss_model
-
-        # Expose legacy attributes from link_config for backward compat
-        self.headers = self.link_config.headers
-        self.header_duration = self.link_config.header_duration
-        self.payload_duration = self.link_config.payload_duration
-        self.transceiver_wait = self.link_config.transceiver_wait
-        self.obw = self.link_config.obw
-        self.payloads = self.link_config.payloads
-        self.threshold = self.link_config.threshold
-        self.time_on_air = self.link_config.time_on_air
+        # Expose legacy attributes from _default_lc for backward compat
+        self.headers = _default_lc.headers
+        self.header_duration = _default_lc.header_duration
+        self.payload_duration = _default_lc.payload_duration
+        self.transceiver_wait = _default_lc.transceiver_wait
+        self.obw = _default_lc.obw
+        self.payloads = _default_lc.payloads
+        self.threshold = _default_lc.threshold
+        self.time_on_air = _default_lc.time_on_air
 
         # ---- Relay link ----
         if relay_link_config is not None:
             self.relay_link_config = relay_link_config
+            if not callable(relay_link_config):
+                if self.relay_link_config.pathloss_model is None:
+                    self.relay_link_config.pathloss_model = self.pathloss_model
+        elif callable(self.link_config):
+            # Callable end-device link: relay uses the representative LR-FHSS config
+            self.relay_link_config = _default_lc
         else:
             # Default: relays forward using the same link as end devices
             self.relay_link_config = self.link_config
-
-        # Attach pathloss_model to relay_link_config if not already set
-        if self.relay_link_config.pathloss_model is None:
-            self.relay_link_config.pathloss_model = self.pathloss_model

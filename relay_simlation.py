@@ -10,6 +10,7 @@ import pandas as pd
 from lrfhss.traffic import *
 from lrfhss.fading import No_Fading, Rayleigh_Fading
 from lrfhss.link import LinkConfig
+from lrfhss.pathloss import LogDistance_PathLoss
 
 # =====================================================================
 # Simulation parameters
@@ -25,6 +26,16 @@ hours = 24                            # Simulation duration in hours.
 max_radius = 3000                     # Cell radius (meters).
 
 # %%
+
+# =====================================================================
+# Path-loss model  (log-distance, shared by all links)
+# =====================================================================
+pathloss_model = LogDistance_PathLoss({
+    'gamma': 2.32,    # Path-loss exponent.
+    'd0':    1000.0,  # Reference distance (m).
+    'lpld0': 128.95,  # Path loss at d0 (dB).
+    'std':   7.8,     # Shadowing std deviation (dB).
+})
 
 # =====================================================================
 # Relay positions - 3 relays at 1.5 km, 120 degrees apart
@@ -67,6 +78,7 @@ def lora_sf_by_distance(distance):
         payload_size=20,
         sensitivity=-120.0,
         transmission_power=14.0,
+        pathloss_model=pathloss_model,
         sf=sf,
         bw=125,
         cr=1,
@@ -81,6 +93,7 @@ lrfhss_link_config = LinkConfig(
     payload_size=20,                   # Application payload size (bytes).
     sensitivity=-120.0,                # Receiver sensitivity (dBm).
     transmission_power=14.0,           # Device transmit power (dBm).
+    pathloss_model=pathloss_model,     # Log-distance path-loss model.
     headers=3,                         # Number of header replicas.
     header_duration=0.233472,          # Duration of one header (seconds).
     payload_duration=0.1024,           # Duration of one payload fragment (s).
@@ -131,10 +144,13 @@ settings_template = {
     'relay_dutycycle_period_s': 60.0,  # Relay duty-cycle period (seconds).
     'relay_dutycycle_percent': 70.0,   # Relay listening share per period (%).
     'lora_channels': 8,                # LoRa channels at base station.
-    'gamma': 2.32,                     # Path-loss exponent.
-    'd0': 1000.0,                      # Reference distance (m).
-    'lpld0': 128.95,                   # Path loss at d0 (dB).
-    'std': 7.8,                        # Shadowing std deviation (dB).
+    'pathloss_class': LogDistance_PathLoss,  # Path-loss model class.
+    'pathloss_param': {                # Path-loss model parameters.
+        'gamma': 2.32,                 #   Path-loss exponent.
+        'd0':    1000.0,               #   Reference distance (m).
+        'lpld0': 128.95,               #   Path loss at d0 (dB).
+        'std':   7.8,                  #   Shadowing std deviation (dB).
+    },
     'base_position': (0, 0),           # Gateway position.
 }
 
