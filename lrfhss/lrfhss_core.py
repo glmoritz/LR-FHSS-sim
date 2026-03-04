@@ -2,7 +2,8 @@ import random
 import math
 import numpy as np
 from abc import ABC, abstractmethod
-from lrfhss.link import lora_sensitivity, lora_min_snr
+from collections import deque
+from lrfhss.link import lora_sensitivity, lora_min_snr, lora_non_orth_delta
 
         
 class Fragment():
@@ -58,9 +59,11 @@ class Packet():
         self.index_transmission = 0
         self.success = 0
         self.fragments = []
+        self.threshold = None  # per-packet decode threshold
 
         if link_config is not None:
             self.link_type = link_config.link_type
+            self.threshold = getattr(link_config, 'threshold', None)
             if link_config.link_type == 'lora':
                 self._build_lora(link_config, fading_generator)
             else:
@@ -122,6 +125,7 @@ class Packet():
         c.index_transmission = 0
         c.success = 0
         c.link_type = self.link_type
+        c.threshold = self.threshold
         c.channels = list(self.channels)
         c.fragments = []
         for f in self.fragments:
@@ -149,11 +153,48 @@ class Fading(ABC):
     @abstractmethod
     def __init__(self, fading_param):
         self.fading_param = fading_param
-    
+
     @abstractmethod
     def fading_function(self):
         pass
-        
+
+
+class PathLoss(ABC):
+    """Abstract base class for pluggable path-loss models.
+
+    Sub-classes must implement :meth:`path_loss_db`, which returns the
+    one-way path loss **in dB** for a given distance in metres.  The
+    returned value is used as::
+
+        rssi_dBm = tx_power_dBm - path_loss_db(distance)
+
+    Parameters
+    ----------
+    pathloss_param : dict
+        Model-specific parameters (passed through to the sub-class).
+    """
+
+    @abstractmethod
+    def __init__(self, pathloss_param):
+        self.pathloss_param = pathloss_param
+
+    @abstractmethod
+    def path_loss_db(self, distance: float) -> float:
+        """Return path loss in dB for *distance* metres.
+
+        Parameters
+        ----------
+        distance : float
+            Distance between transmitter and receiver in metres.
+
+        Returns
+        -------
+        float
+            Path loss in dB (positive value → attenuation).
+        """
+        pass
+
+
 class Node():
     """A network end-device that transmits packets.
 
@@ -186,22 +227,30 @@ class Node():
                  fading_generator=None, max_distance=2250,
                  transmission_power=14, *,
                  link_config=None, position=None,
-                 base_position=(0, 0)):
+                 base_position=(0, 0), pathloss_model=None):
         self.id = id(self)
         self.transmitted = 0
         self.traffic_generator = traffic_generator
         self.fading_generator = fading_generator
         self.transmission_power = transmission_power
+        self.min_distance = min_distance
         self.max_distance = max_distance
         self.link_config = link_config
+        # Path-loss model: prefer explicit arg, then link_config, then None
+        if pathloss_model is not None:
+            self.pathloss_model = pathloss_model
+        elif link_config is not None and getattr(link_config, 'pathloss_model', None) is not None:
+            self.pathloss_model = link_config.pathloss_model
+        else:
+            self.pathloss_model = None
 
         # -- 2D position ------------------------------------------------
         if position is not None:
             self.x, self.y = position[0], position[1]
         else:
-            # Uniform random point inside circle of radius max_distance
+            # Uniform random point inside circle of ring of radius [min_distance, max_distance]
             angle = random.uniform(0, 2 * math.pi)
-            r = max_distance * math.sqrt(random.uniform(0, 1))
+            r = min_distance + (max_distance - min_distance) * random.uniform(0, 1)
             self.x = r * math.cos(angle)
             self.y = r * math.sin(angle)
 
@@ -227,6 +276,23 @@ class Node():
             self.transceiver_wait = transceiver_wait
 
         # -- Initial packet ---------------------------------------------
+        if self.link_config is not None or self.obw is not None:
+            self.packet = self._create_packet()
+        else:
+            self.packet = None  # bare node; call set_link_config() next
+
+    def set_link_config(self, link_config):
+        """Assign a LinkConfig after construction (e.g. per-node configs).
+
+        Updates all packet-creation fields and creates the initial packet.
+        """
+        self.link_config = link_config
+        self.obw = link_config.obw
+        self.headers = link_config.headers
+        self.payloads = link_config.payloads
+        self.header_duration = link_config.header_duration
+        self.payload_duration = link_config.payload_duration
+        self.transceiver_wait = link_config.transceiver_wait
         self.packet = self._create_packet()
 
     # -- helpers --------------------------------------------------------
@@ -291,8 +357,15 @@ class Node():
                 for rx in receivers:
                     if getattr(rx, '_is_transmitting', False):
                         continue
+                    if not getattr(rx, '_is_listening', True):
+                        continue
                     rx_frag = rx_packets[rx].fragments[frag_idx]
                     rx_frag.timestamp = env.now
+                    # Store per-fragment reception context so the
+                    # receiver can compute interferer RSSI later
+                    # (needed for LoRa inter-SF interference model).
+                    rx_frag.rx_distance = self.distance_to(rx.x, rx.y)
+                    rx_frag.tx_power = self.transmission_power
                     rx.check_collision(rx_frag)
                     rx.receive_packet(rx_frag)
 
@@ -302,10 +375,13 @@ class Node():
                 for rx in receivers:
                     if getattr(rx, '_is_transmitting', False):
                         continue
+                    if not getattr(rx, '_is_listening', True):
+                        continue
                     rx_frag = rx_packets[rx].fragments[frag_idx]
                     dist = self.distance_to(rx.x, rx.y)
                     rx.finish_fragment(rx_frag, dist,
-                                       self.transmission_power)
+                                       self.transmission_power,
+                                       self.pathloss_model)
                     rx_pkt = rx_packets[rx]
                     if rx_pkt.success == 0:
                         rx.try_decode(rx_pkt, env.now)
@@ -329,18 +405,26 @@ class Base():
         LR-FHSS receiver sensitivity (dBm).
     lora_channels : int
         Number of conventional LoRa channels (default 0 = no LoRa).
-    gamma : float
-        Path-loss exponent for log-distance model (LoRa).
-    d0 : float
-        Reference distance in metres (LoRa path-loss).
-    lpld0 : float
-        Path loss at reference distance d0 in dB (LoRa).
-    std : float
-        Shadowing standard deviation in dB (LoRa).
+
+    .. deprecated::
+        The ``gamma``, ``d0``, ``lpld0``, and ``std`` keyword arguments are
+        no longer used.  Path-loss is now configured via the
+        :class:`~lrfhss.pathloss.PathLoss` model passed per-fragment
+        through :meth:`finish_fragment`.  The arguments are silently
+        accepted for backward compatibility but have no effect.
     """
     def __init__(self, obw, threshold, sensitivity, *,
-                 lora_channels=0, gamma=2.32, d0=1000.0,
-                 lpld0=128.95, std=7.8, position=(0, 0)):
+                 lora_channels=0, position=(0, 0),
+                 # --- kept for backward compat only, no longer used ---
+                 gamma=None, d0=None, lpld0=None, std=None):
+        if any(v is not None for v in (gamma, d0, lpld0, std)):
+            import warnings
+            warnings.warn(
+                "Base: 'gamma', 'd0', 'lpld0', 'std' are deprecated and "
+                "have no effect.  Configure path loss via the pathloss_model "
+                "on LinkConfig (or Node) instead.",
+                DeprecationWarning, stacklevel=2,
+            )
         self.id = id(self)
         self.obw = obw
         self.lora_channels = lora_channels
@@ -352,17 +436,17 @@ class Base():
         for channel in range(obw, obw + lora_channels):
             self.transmitting[channel] = []
         self.packets_received = {}
-        self.decoded_packets = set()  # Track decoded packet IDs (dedup)
+        self.decoded_packets = set()  # Track decoded packet keys (dedup)
         self.threshold = threshold
         self.sensitivity = sensitivity
         # 2D position (used for distance computation by Node.transmit)
         self.x, self.y = position
-        self.base_type = 'sink'
-        # Log-distance path-loss parameters (used for LoRa fragments)
-        self.gamma = gamma
-        self.d0 = d0
-        self.lpld0 = lpld0
-        self.std = std
+        self.base_type = 'sink'      
+
+    def _packet_dedup_key(self, packet):
+        """Return a stable dedup key for sink-side packet accounting."""
+        pkt_id = getattr(packet, 'original_packet_id', packet.id)
+        return (packet.node_id, pkt_id)
 
     def add_packet(self, packet):
         pass
@@ -376,70 +460,133 @@ class Base():
             self.transmitting[fragment.channel] = []
         self.transmitting[fragment.channel].append(fragment)
 
-    def finish_fragment(self, fragment, distance, transmission_power):
+    def finish_fragment(self, fragment, distance, transmission_power,
+                        pathloss_model=None):
         """Mark a fragment as finished and determine success.
 
-        For LR-FHSS fragments: uses the existing fading-intensity SNR model.
-        For LoRa fragments: uses log-distance path-loss -> RSSI/SNR checks
-        with per-SF sensitivity and minimum SNR requirements.
+        For LR-FHSS and LoRa fragments alike, the path loss is evaluated
+        via *pathloss_model* (a :class:`PathLoss` instance).  Both link
+        types now work entirely in the **dB domain**:
+
+        .. code-block:: text
+
+            rssi [dBm] = tx_power [dBm]
+                         - path_loss_db(distance) [dB]
+                         + fading_gain [dB]          # 20·log10(intensity)
+
+        For LoRa, an additional SNR check against the per-SF minimum is
+        applied.
 
         If the fragment was cancelled (e.g. half-duplex clear), this
         method returns early and marks it as transmitted but failed.
+
+        Parameters
+        ----------
+        fragment : Fragment
+        distance : float
+            Transmitter–receiver distance in metres.
+        transmission_power : float
+            Transmit power in dBm.
+        pathloss_model : PathLoss or None
+            Path-loss model to use.  If *None* a :class:`ValueError` is
+            raised — every link must carry a pathloss_model.
         """
         # Safety: fragment may have been cleared by half-duplex cancel
         ch_list = self.transmitting.get(fragment.channel, [])
         if fragment not in ch_list:
             fragment.transmitted = 1
             return
+
+        if pathloss_model is None:
+            raise ValueError(
+                "finish_fragment: pathloss_model is None.  "
+                "Set a PathLoss instance on your LinkConfig (or Node)."
+            )
+
         ch_list.remove(fragment)
 
         if fragment.type == 'lora':
-            # --- Conventional LoRa reception check ---
-            self._finish_lora_fragment(fragment, distance, transmission_power)
+            self._finish_lora_fragment(fragment, distance,
+                                       transmission_power, pathloss_model)
         else:
-            # --- LR-FHSS reception check (original logic) ---
-            self._finish_lrfhss_fragment(fragment, distance, transmission_power)
+            self._finish_lrfhss_fragment(fragment, distance,
+                                          transmission_power, pathloss_model)
 
-    def _finish_lrfhss_fragment(self, fragment, distance, transmission_power):
-        """Original LR-FHSS fragment success check."""
-        transmission_power_W = 10 ** (transmission_power / 10) / 1000
-        sensitivity_W = 10 ** (self.sensitivity / 10) / 1000
+    def _finish_lrfhss_fragment(self, fragment, distance, transmission_power,
+                                 pathloss_model):
+        """LR-FHSS fragment success check — fully in the dB domain.
 
-        snr = (transmission_power_W * (fragment.intensity ** 2)) / (distance ** 4)
+        RSSI is computed as::
 
-        if len(fragment.collided) == 0 and snr > sensitivity_W:
-            fragment.success = 1
-        fragment.transmitted = 1
+            rssi = tx_power - path_loss_db(d) + 20·log10(intensity)
 
-    def _finish_lora_fragment(self, fragment, distance, transmission_power):
-        """Conventional LoRa fragment success check using log-distance
-        path-loss model, per-SF sensitivity and SNR requirement."""
-        # Guard against zero distance (co-located)
-        if distance <= 0:
-            distance = 1.0
+        and compared against the receiver sensitivity threshold.
+        """
+        path_loss = pathloss_model.path_loss_db(distance)
+        rssi = transmission_power - path_loss     # dBm
 
-        # Log-distance path loss (dB)
-        lpl = (10 * self.gamma * math.log10(distance / self.d0)
-               + np.random.normal(self.lpld0, self.std))
-        rssi = transmission_power - lpl  # dBm
-
-        # Apply fading intensity as additional gain/loss (dB scale)
-        # intensity is a linear multiplier from the Fading class, convert:
-        #   gain_dB = 20*log10(intensity)  (voltage-domain fading)
+        # Apply fading as a dB gain (intensity is a linear amplitude factor)
         if fragment.intensity > 0:
             rssi += 20.0 * math.log10(fragment.intensity)
 
-        # Noise floor for LoRa bandwidth
+        if len(fragment.collided) == 0 and rssi > self.sensitivity:
+            fragment.success = 1
+        fragment.transmitted = 1
+
+    def _finish_lora_fragment(self, fragment, distance, transmission_power,
+                               pathloss_model):
+        """LoRa fragment success check — dB domain, per-SF sensitivity/SNR.
+
+        Uses the same path-loss model as LR-FHSS.  Additionally checks
+        the minimum SNR requirement for the fragment's spreading factor.
+        """
+        path_loss = pathloss_model.path_loss_db(distance)
+        rssi = transmission_power - path_loss     # dBm
+
+        # Apply fading as a dB gain (intensity is a linear amplitude factor)
+        if fragment.intensity > 0:
+            rssi += 20.0 * math.log10(fragment.intensity)
+
+        # Noise floor for the LoRa bandwidth
         noise_floor = -174.0 + 10.0 * np.log10(fragment.bw * 1e3)  # dBm
         snr_db = rssi - noise_floor
 
-        # Check sensitivity and minimum SNR for the SF
+        # Per-SF sensitivity and SNR requirements
         min_sensi = lora_sensitivity(fragment.sf, fragment.bw)
         min_snr = lora_min_snr(fragment.sf)
 
-        if (len(fragment.collided) == 0
-                and rssi > min_sensi
-                and snr_db > min_snr):
+        if rssi <= min_sensi or snr_db <= min_snr:
+            fragment.transmitted = 1
+            return
+
+        # --- Inter-SF interference check (Croce et al. 2018) ---
+        # For each collider on the same channel, compute the SIR and
+        # compare against the non-orthogonal isolation threshold.
+        survived = True
+        for collider in fragment.collided:
+            if collider.type != 'lora':
+                # LR-FHSS collider on same channel -> treat as fatal
+                survived = False
+                break
+            # Compute (or reuse) collider's RSSI at this receiver
+            c_rssi = getattr(collider, 'rssi', None)
+            if c_rssi is None:
+                c_dist = getattr(collider, 'rx_distance', None)
+                c_txp = getattr(collider, 'tx_power', None)
+                if c_dist is not None and c_txp is not None:
+                    c_rssi = self._compute_lora_rssi(
+                        collider, c_dist, c_txp)
+                else:
+                    # Cannot determine interferer strength -> assume fatal
+                    survived = False
+                    break
+            sir_db = rssi - c_rssi  # dB
+            threshold = lora_non_orth_delta(fragment.sf, collider.sf)
+            if sir_db < threshold:
+                survived = False
+                break
+
+        if survived:
             fragment.success = 1
         fragment.transmitted = 1
 
@@ -471,13 +618,15 @@ class Base():
         p_success = sum(1 for f in packet.fragments
                         if f.type == 'payload' and f.success == 1)
 
+        # Use per-packet threshold if available, else fall back to Base's
+        threshold = packet.threshold if packet.threshold is not None else self.threshold
         success = 1 if ((h_success > 0)
-                        and (p_success >= self.threshold)) else 0
+                        and (p_success >= threshold)) else 0
         if success == 1:
             packet.success = 1
-            pkt_id = getattr(packet, 'original_packet_id', packet.id)
-            if pkt_id not in self.decoded_packets:
-                self.decoded_packets.add(pkt_id)
+            dedup_key = self._packet_dedup_key(packet)
+            if dedup_key not in self.decoded_packets:
+                self.decoded_packets.add(dedup_key)
                 self.packets_received[packet.node_id] += 1
             return True
         else:
@@ -487,9 +636,9 @@ class Base():
         """LoRa decode: the single fragment must have succeeded."""
         if len(packet.fragments) > 0 and packet.fragments[0].success == 1:
             packet.success = 1
-            pkt_id = getattr(packet, 'original_packet_id', packet.id)
-            if pkt_id not in self.decoded_packets:
-                self.decoded_packets.add(pkt_id)
+            dedup_key = self._packet_dedup_key(packet)
+            if dedup_key not in self.decoded_packets:
+                self.decoded_packets.add(dedup_key)
                 self.packets_received[packet.node_id] += 1
             return True
         return False
@@ -523,18 +672,24 @@ class Relay(Base):
     position : tuple (x, y)
         2D position of the relay.
     forward_link_config : LinkConfig
-        Link configuration used when forwarding to the sink.
+        Link configuration used when forwarding to the sink.  Must have
+        a ``pathloss_model`` set for the relay→sink hop.
     fading_generator : Fading
         Fading model used for forwarded-packet fragment generation.
     transmission_power : float
         Transmit power in dBm for forwarded packets.
-    lora_channels, gamma, d0, lpld0, std :
-        Inherited path-loss parameters (see :class:`Base`).
+
+    .. deprecated::
+        The ``lora_channels``, ``gamma``, ``d0``, ``lpld0``, ``std``
+        keyword arguments are forwarded to :class:`Base` for backward
+        compatibility but have no effect on path-loss calculation.
     """
 
     def __init__(self, obw, threshold, sensitivity, *,
                  position, forward_link_config, fading_generator,
                  transmission_power=14,
+                 dutycycle_period_s=None,
+                 dutycycle_percent=None,
                  lora_channels=0, gamma=2.32, d0=1000.0,
                  lpld0=128.95, std=7.8):
         super().__init__(obw, threshold, sensitivity,
@@ -551,13 +706,32 @@ class Relay(Base):
         self.env = None
         self.sink = None
 
+    def _dutycycle_enabled(self):
+        return (self.dutycycle_period_s is not None
+                and self.dutycycle_percent is not None
+                and self.dutycycle_period_s > 0
+                and 0 <= self.dutycycle_percent < 100)
+
+    def start(self):
+        """Start relay background process when duty-cycle mode is enabled."""
+        if self.env is None:
+            return
+        if self._dutycycle_enabled():
+            self.env.process(self._dutycycle_loop())
+
     # -- override try_decode to trigger forwarding ----------------------
 
     def try_decode(self, packet, now):
         """Decode and, on success, schedule forwarding to the sink."""
         decoded = super().try_decode(packet, now)
         if decoded and self.env is not None and self.sink is not None:
-            self.env.process(self._forward(packet))
+            pkt_id = getattr(packet, 'original_packet_id', packet.id)
+            dedup_key = (packet.node_id, pkt_id)
+            if dedup_key not in self._queued_packet_ids:
+                self._queued_packet_ids.add(dedup_key)
+                self._forward_queue.append((packet.node_id, pkt_id))
+            if not self._dutycycle_enabled():
+                self.env.process(self._flush_queue())
         return decoded
 
     # -- half-duplex helpers --------------------------------------------
@@ -611,10 +785,57 @@ class Relay(Base):
             self.sink.check_collision(frag)
             self.sink.receive_packet(frag)
             yield self.env.timeout(frag.duration)
+            fwd_pathloss = getattr(self.forward_link_config,
+                                   'pathloss_model', None)
             self.sink.finish_fragment(frag, dist_to_sink,
-                                     self.transmission_power)
+                                     self.transmission_power,
+                                     fwd_pathloss)
             if fwd.success == 0:
                 self.sink.try_decode(fwd, self.env.now)
 
         self.relayed += 1
+
+    def _flush_queue(self):
+        """Forward buffered packets (used by non-duty-cycle mode)."""
+        if self._is_transmitting or len(self._forward_queue) == 0:
+            return
+        self._cancel_receptions()
+        self._is_listening = False
+        self._is_transmitting = True
+        yield self.env.timeout(0.001)
+
+        while len(self._forward_queue) > 0:
+            node_id, pkt_id = self._forward_queue.popleft()
+            yield self.env.process(self._forward(node_id, pkt_id))
+            self._queued_packet_ids.discard((node_id, pkt_id))
+
         self._is_transmitting = False
+        self._is_listening = True
+
+    def _dutycycle_loop(self):
+        """Alternate listen and relay windows based on duty-cycle config."""
+        period = float(self.dutycycle_period_s)
+        listen_time = period * (float(self.dutycycle_percent) / 100.0)
+        relay_time = period - listen_time
+
+        while True:
+            if listen_time > 0:
+                self._is_listening = True
+                self._is_transmitting = False
+                yield self.env.timeout(listen_time)
+
+            if relay_time > 0:
+                self._cancel_receptions()
+                self._is_listening = False
+                self._is_transmitting = True
+                yield self.env.timeout(0.001)
+
+                window_end = self.env.now + relay_time
+                while len(self._forward_queue) > 0 and self.env.now < window_end:
+                    node_id, pkt_id = self._forward_queue.popleft()
+                    yield self.env.process(self._forward(node_id, pkt_id))
+                    self._queued_packet_ids.discard((node_id, pkt_id))
+
+                remaining = window_end - self.env.now
+                if remaining > 0:
+                    yield self.env.timeout(remaining)

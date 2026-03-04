@@ -29,10 +29,6 @@ def run_sim(settings: Settings, seed=0):
 
     # ---- Parameters ----
     lora_ch = getattr(settings, 'lora_channels', 0)
-    gamma = getattr(settings, 'gamma', 2.32)
-    d0 = getattr(settings, 'd0', 1000.0)
-    lpld0 = getattr(settings, 'lpld0', 128.95)
-    std = getattr(settings, 'std', 7.8)
     base_pos = getattr(settings, 'base_position', (0, 0))
 
     link_config = getattr(settings, 'link_config', None)
@@ -45,31 +41,46 @@ def run_sim(settings: Settings, seed=0):
         bs = BaseACRDA(settings.obw, settings.window_size,
                        settings.window_step, settings.time_on_air,
                        settings.threshold, settings.sensitivity,
-                       lora_channels=lora_ch, gamma=gamma, d0=d0,
-                       lpld0=lpld0, std=std, position=base_pos)
+                       lora_channels=lora_ch, position=base_pos)
         env.process(bs.sic_window(env))
     else:
         bs = Base(settings.obw, settings.threshold, settings.sensitivity,
-                  lora_channels=lora_ch, gamma=gamma, d0=d0,
-                  lpld0=lpld0, std=std, position=base_pos)
+                  lora_channels=lora_ch, position=base_pos)
 
     # ---- Relay base stations (passive listeners) ----
     relays = []
     fwd_link = relay_link_config or link_config
     for i in range(number_relays):
         pos = relay_positions[i] if relay_positions else (0, 0)
+        # Resolve forward link config for this relay.
+        # If relay_link_config is a concrete LinkConfig, use it.
+        # If it (or link_config) is callable, resolve at relay's
+        # distance to the sink.
+        relay_dist = math.sqrt((pos[0] - base_pos[0]) ** 2
+                               + (pos[1] - base_pos[1]) ** 2)
+        if relay_link_config is not None and not callable(relay_link_config):
+            fwd_link = relay_link_config
+        elif relay_link_config is not None and callable(relay_link_config):
+            fwd_link = relay_link_config(relay_dist)
+        elif link_config_is_callable:
+            fwd_link = link_config(relay_dist)
+        else:
+            fwd_link = link_config
         relay = Relay(
             settings.obw, settings.threshold, settings.sensitivity,
             position=pos,
             forward_link_config=fwd_link,
             fading_generator=settings.fading_generator,
             transmission_power=settings.transmission_power,
+            dutycycle_period_s=relay_dutycycle_period_s,
+            dutycycle_percent=relay_dutycycle_percent,
             lora_channels=lora_ch, gamma=gamma, d0=d0,
             lpld0=lpld0, std=std,
         )
         # Bind SimPy env and sink reference for forwarding
         relay.env = env
         relay.sink = bs
+        relay.start()
         relays.append(relay)
 
     # ---- Receivers list: sink + all relays ----
@@ -82,11 +93,14 @@ def run_sim(settings: Settings, seed=0):
             node = Node(
                 traffic_generator=settings.traffic_generator,
                 fading_generator=settings.fading_generator,
+                min_distance=getattr(settings, 'min_distance', 0),
                 max_distance=settings.max_distance,
                 transmission_power=settings.transmission_power,
-                link_config=link_config,
+                link_config=None if link_config_is_callable else link_config,
                 base_position=base_pos,
             )
+            if link_config_is_callable:
+                node.set_link_config(link_config(node.distance))
         else:
             # Legacy path (backward compatible)
             node = Node(settings.obw, settings.headers, settings.payloads,
@@ -94,7 +108,8 @@ def run_sim(settings: Settings, seed=0):
                         settings.transceiver_wait,
                         settings.traffic_generator,
                         settings.fading_generator,
-                        settings.max_distance, settings.transmission_power)
+                        settings.max_distance, settings.transmission_power,
+                        pathloss_model=settings.pathloss_model)
 
         # Register node at every receiver
         for rx in receivers:

@@ -30,6 +30,29 @@ _SENSI_TABLE = np.array([
 # Minimum SNR (dB) required for demodulation at each SF (SF7..SF12)
 _SNR_REQ = np.array([-7.5, -10.0, -12.5, -15.0, -17.5, -20.0])
 
+# ---------------------------------------------------------------------------
+# LoRa inter-SF interference isolation thresholds (dB)
+#
+# D. Croce, M. Gucciardo, S. Mangione, G. Santaromita and I. Tinnirello,
+# "Impact of LoRa Imperfect Orthogonality: Analysis of Link-Level
+# Performance," in IEEE Communications Letters, vol. 22, no. 4,
+# pp. 796-799, April 2018, doi: 10.1109/LCOMM.2018.2797057.
+#
+# _NON_ORTH_DELTA[i][j] gives the minimum SIR (dB) that a desired signal
+# at SF (7+i) needs over an interferer at SF (7+j) to be decoded.
+# Diagonal entries (same-SF, i.e. co-SF capture) require +1 dB SIR.
+# Off-diagonal entries are negative, meaning the desired signal can be
+# weaker than the interferer by that many dB and still survive.
+# ---------------------------------------------------------------------------
+_NON_ORTH_DELTA = np.array([
+    [  1,  -8,  -9,  -9,  -9,  -9],   # desired SF7
+    [-11,   1, -11, -12, -13, -13],   # desired SF8
+    [-15, -13,   1, -13, -14, -15],   # desired SF9
+    [-19, -18, -17,   1, -17, -18],   # desired SF10
+    [-22, -22, -21, -20,   1, -20],   # desired SF11
+    [-25, -25, -25, -24, -23,   1],   # desired SF12
+], dtype=float)
+
 # EU868 LoRa carrier frequencies (Hz)
 LORA_CARRIER_FREQUENCIES = np.array([
     867_100_000, 867_300_000, 867_500_000, 867_700_000,
@@ -80,6 +103,35 @@ def lora_min_snr(sf: int) -> float:
     if sf < 7 or sf > 12:
         raise ValueError(f"SF must be 7-12, got {sf}")
     return float(_SNR_REQ[sf - 7])
+
+
+def lora_non_orth_delta(sf_desired: int, sf_interferer: int) -> float:
+    """Return the minimum SIR (dB) for *sf_desired* to survive *sf_interferer*.
+
+    A received signal at *sf_desired* can tolerate an interferer at
+    *sf_interferer* as long as the Signal-to-Interferer Ratio (SIR)
+    exceeds the returned threshold.  Negative thresholds mean the
+    desired signal can be weaker than the interferer by that many dB.
+
+    Source: Croce et al., IEEE Comms Letters, vol. 22, no. 4, 2018.
+
+    Parameters
+    ----------
+    sf_desired : int
+        Spreading factor of the desired signal (7-12).
+    sf_interferer : int
+        Spreading factor of the interfering signal (7-12).
+
+    Returns
+    -------
+    float
+        Minimum SIR in dB.
+    """
+    if sf_desired < 7 or sf_desired > 12:
+        raise ValueError(f"sf_desired must be 7-12, got {sf_desired}")
+    if sf_interferer < 7 or sf_interferer > 12:
+        raise ValueError(f"sf_interferer must be 7-12, got {sf_interferer}")
+    return float(_NON_ORTH_DELTA[sf_desired - 7, sf_interferer - 7])
 
 
 def lora_airtime(sf: int, cr: int, payload_size: int, bw: int) -> float:
@@ -166,7 +218,15 @@ class LinkConfig:
         sf, bw, cr, lora_channels.
 
     Common:
-        payload_size, sensitivity, transmission_power.
+        payload_size, sensitivity, transmission_power, pathloss_model.
+
+    pathloss_model : PathLoss or None
+        Pluggable path-loss model used for every fragment on this link.
+        Must be an instance of a :class:`~lrfhss.lrfhss_core.PathLoss`
+        sub-class (e.g. :class:`~lrfhss.pathloss.LogDistance_PathLoss`).
+        If *None* the model must be supplied explicitly when creating a
+        :class:`~lrfhss.lrfhss_core.Node` or will raise at simulation
+        time.
     """
 
     def __init__(
@@ -176,6 +236,7 @@ class LinkConfig:
         payload_size: int = 10,
         sensitivity: float = -120.0,
         transmission_power: float = 14.0,
+        pathloss_model=None,
         # --- LR-FHSS specific ---
         headers: int = 3,
         header_duration: float = 0.233472,
@@ -199,6 +260,7 @@ class LinkConfig:
         self.payload_size = payload_size
         self.sensitivity = sensitivity
         self.transmission_power = transmission_power
+        self.pathloss_model = pathloss_model
 
         if self.link_type == 'lrfhss':
             self._init_lrfhss(headers, header_duration, payload_duration,
