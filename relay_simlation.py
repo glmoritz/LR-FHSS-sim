@@ -3,7 +3,10 @@
 from matplotlib.offsetbox import DEBUG
 
 from lrfhss.run import *
+import itertools
+import os
 import time
+from collections import defaultdict
 from joblib import Parallel, delayed
 import numpy as np
 import matplotlib.pyplot as plt
@@ -22,8 +25,10 @@ nNodes_min = 10000                     # Minimum total number of nodes.
 nNodes_max = 100000                    # Maximum total number of nodes.
 nNodes = np.linspace(nNodes_min, nNodes_max, nNodes_points, dtype=int)
 
-loops = 100                           # Monte-Carlo repetitions per point.
-jobs = 16                             # Parallel worker threads.
+seeds = [42, 123, 456, 789]            # Four fixed seeds — averaged for each node-count point.
+jobs = 32                             # One worker per physical core (32-core machine).
+# Total parallel tasks: nNodes_points × scenarios × seeds = 10 × 4 × 4 = 160
+checkpoint_dir = 'checkpoints'        # Directory for per-task resume files.
 hours = 24                            # Simulation duration in hours.
 max_radius = 3000                     # Cell radius (meters).
 
@@ -101,10 +106,14 @@ lrfhss_link_config = LinkConfig(
     payload_duration=0.1024,           # Duration of one payload fragment (s).
     transceiver_wait=0.006472,         # Radio turnaround / wait time (s).
     code='1/3',                        # Coding rate.
-    ocw_hz=1_523_000,                  # Occupied Channel Width (Hz) - 1.523 MHz.
+    #ocw_hz=1_523_000,                  # Occupied Channel Width (Hz) - 1.523 MHz.
+    #obw_hz=488,                        # Occupied Bandwidth per sub-channel (Hz).
+    #grid_spacing_hz=25_400,            # Minimum hop spacing (Hz) - 25.4 kHz.
+    # US/AU - Grid structure: 3120 total channels, 52 grids, 60 channels/grid.
+    ocw_hz=336_000,                  # Europe - Occupied Channel Width (Hz) - 336KHz.
     obw_hz=488,                        # Occupied Bandwidth per sub-channel (Hz).
-    grid_spacing_hz=25_400,            # Minimum hop spacing (Hz) - 25.4 kHz.
-    # Grid structure: 3120 total channels, 52 grids, 60 channels/grid.
+    grid_spacing_hz=3_900,            # Europe - Minimum hop spacing (Hz) - 3.9 kHz.
+    # EU - Grid structure: 688 total channels, 8 grids, 86 channels/grid.
     payloads=None,                     # Payload fragments (None = auto).
     threshold=None,                    # Decode threshold  (None = auto).
 )
@@ -161,34 +170,69 @@ settings_template = {
 # %%
 
 # =====================================================================
-# Helper: run a scenario for one node count
-# link_cfg can be a LinkConfig instance OR a callable(distance)->LinkConfig
+# Scenario parameter table — maps scenario key → link and relay config.
+# Defined at module level so joblib worker processes can pickle it.
 # =====================================================================
-def run_scenario(n_total, link_cfg, number_relays=0, relay_pos=None):
-    DEBUG = False
-    """Run *loops* Monte-Carlo repetitions and return
-    (mean_success, std_success, mean_goodput, mean_tx)."""
-    s_dict = settings_template.copy()
-    s_dict['number_nodes'] = n_total
-    s_dict['link_config'] = link_cfg
-    s_dict['number_relays'] = number_relays
-    s_dict['relay_positions'] = relay_pos
-    s = Settings(**s_dict)
+SCENARIO_CONFIGS = {
+    'LRFHSS': {
+        'link_cfg':      lrfhss_link_config,
+        'number_relays': 0,
+        'relay_pos':     None,
+    },
+    'LoRa_SF_rings': {
+        'link_cfg':      lora_sf_by_distance,
+        'number_relays': 0,
+        'relay_pos':     None,
+    },
+    'LRFHSS_3relays': {
+        'link_cfg':      lrfhss_link_config,
+        'number_relays': 3,
+        'relay_pos':     relay_positions,
+    },
+    'LoRa_SF_rings_3relays': {
+        'link_cfg':      lora_sf_by_distance,
+        'number_relays': 3,
+        'relay_pos':     relay_positions,
+    },
+}
 
-    if DEBUG:
-        results = [run_sim(s, seed=1)]  # single run for quick testing
-    else:    
-        results = Parallel(n_jobs=jobs)(
-            delayed(run_sim)(s, seed=seed) for seed in range(loops)
-        )
-        
-    successes = [r[0][0] for r in results if r != 1]
-    goodputs  = [r[1][0] for r in results if r != 1]
-    txs       = [r[2][0] for r in results if r != 1]
-    if len(successes) == 0:
-        return 0.0, 0.0, 0.0, 0.0
-    return (np.mean(successes), np.std(successes),
-            np.mean(goodputs), np.mean(txs))
+
+def _ckpt_path(n, scenario_key, seed):
+    """Return the checkpoint file path for a given task."""
+    return os.path.join(checkpoint_dir, f'{scenario_key}_n{n}_s{seed}.pkl')
+
+
+def run_single(n, scenario_key, seed):
+    """Atomic task: one (node-count, scenario, seed) triple → one run_sim call.
+    Returns (success_rate, goodput, tx_count) or None on failure.
+    If a checkpoint file exists the result is loaded instantly (resume support)."""
+    ckpt = _ckpt_path(n, scenario_key, seed)
+
+    # ── Resume: return cached result if this task already finished ────────
+    if os.path.exists(ckpt):
+        with open(ckpt, 'rb') as f:
+            return pickle.load(f)
+
+    # ── Run simulation ────────────────────────────────────────────────────
+    cfg = SCENARIO_CONFIGS[scenario_key]
+    s_dict = settings_template.copy()
+    s_dict['number_nodes']    = n
+    s_dict['link_config']     = cfg['link_cfg']
+    s_dict['number_relays']   = cfg['number_relays']
+    s_dict['relay_positions'] = cfg['relay_pos']
+    s = Settings(**s_dict)
+    r = run_sim(s, seed=seed)
+    if r == 1:      # failed run — do NOT checkpoint so it will retry
+        return None
+    result = r[0][0], r[1][0], r[2][0]   # (success, goodput, tx)
+
+    # ── Save checkpoint atomically (write to .tmp then rename) ────────────
+    tmp = ckpt + '.tmp'
+    with open(tmp, 'wb') as f:
+        pickle.dump(result, f)
+    os.replace(tmp, ckpt)   # atomic on POSIX — safe against mid-write crashes
+
+    return result
 
 
 if __name__ == '__main__':
@@ -219,59 +263,55 @@ if __name__ == '__main__':
             'scenarios': scenarios,
             'sf_rings': sf_rings,
             'relay_positions': relay_positions,
-            'loops': loops,
+            'seeds': seeds,
         }
         with open(output_file, 'wb') as f:
             pickle.dump(results_dict, f)
 
     # =====================================================================
-    # Main simulation loop
+    # Flat task list — every (nNodes, scenario, seed) combination.
+    # 10 × 4 × 4 = 160 independent tasks dispatched to 32 workers
+    # (~5 rounds of 32 simultaneous jobs).
     # =====================================================================
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    scenario_keys = list(SCENARIO_CONFIGS.keys())
+    task_list = list(itertools.product(nNodes, scenario_keys, seeds))
+
+    cached = sum(1 for n, sc, seed in task_list if os.path.exists(_ckpt_path(n, sc, seed)))
+    print(f'{cached}/{len(task_list)} tasks already cached — will be skipped.')
+
     start = time.perf_counter()
+    print(f'Dispatching {len(task_list)} tasks across {jobs} workers '
+          f'(nNodes={len(nNodes)}, scenarios={len(scenario_keys)}, seeds={seeds})')
+
+    raw_results = Parallel(n_jobs=jobs, backend='loky', verbose=5)(
+        delayed(run_single)(n, sc, seed)
+        for n, sc, seed in task_list
+    )
+
+    # ── Reassemble: bucket results by (n, scenario_key), then aggregate ───
+    bucket = defaultdict(list)   # (n, sc) → [(success, goodput, tx), ...]
+    for (n, sc, _seed), res in zip(task_list, raw_results):
+        if res is not None:
+            bucket[(n, sc)].append(res)
 
     for n in nNodes:
-        print(f'\n===== Total nodes: {n} =====')
+        for sc in scenario_keys:
+            runs = bucket[(n, sc)]
+            if runs:
+                succs = [r[0] for r in runs]
+                gputs = [r[1] for r in runs]
+                txs   = [r[2] for r in runs]
+                m, s_std, g, t = (np.mean(succs), np.std(succs),
+                                  np.mean(gputs), np.mean(txs))
+            else:
+                m, s_std, g, t = 0.0, 0.0, 0.0, 0.0
+            scenarios[sc]['success'].append(m)
+            scenarios[sc]['success_std'].append(s_std)
+            scenarios[sc]['goodput'].append(g)
+            scenarios[sc]['throughput'].append(t)
 
-        # ---- Scenario 1: LR-FHSS, no relays ----
-        print('  [1/4] LR-FHSS, no relays')
-        m, s, g, t = run_scenario(n, lrfhss_link_config)
-        scenarios['LRFHSS']['success'].append(m)
-        scenarios['LRFHSS']['success_std'].append(s)
-        scenarios['LRFHSS']['goodput'].append(g)
-        scenarios['LRFHSS']['throughput'].append(t)
-        save_partial_results()
-
-        # ---- Scenario 2: LoRa SF rings, no relays ----
-        # Uses the callable: each node gets its SF based on distance.
-        print('  [2/4] LoRa SF rings, no relays')
-        m, s, g, t = run_scenario(n, lora_sf_by_distance)
-        scenarios['LoRa_SF_rings']['success'].append(m)
-        scenarios['LoRa_SF_rings']['success_std'].append(s)
-        scenarios['LoRa_SF_rings']['goodput'].append(g)
-        scenarios['LoRa_SF_rings']['throughput'].append(t)
-        save_partial_results()
-
-        # ---- Scenario 3: LR-FHSS + 3 relays ----
-        print('  [3/4] LR-FHSS + 3 relays @ 1.5 km')
-        m, s, g, t = run_scenario(n, lrfhss_link_config,
-                                   number_relays=3,
-                                   relay_pos=relay_positions)
-        scenarios['LRFHSS_3relays']['success'].append(m)
-        scenarios['LRFHSS_3relays']['success_std'].append(s)
-        scenarios['LRFHSS_3relays']['goodput'].append(g)
-        scenarios['LRFHSS_3relays']['throughput'].append(t)
-        save_partial_results()
-
-        # ---- Scenario 4: LoRa SF rings + 3 relays ----
-        print('  [4/4] LoRa SF rings + 3 relays @ 1.5 km')
-        m, s, g, t = run_scenario(n, lora_sf_by_distance,
-                                   number_relays=3,
-                                   relay_pos=relay_positions)
-        scenarios['LoRa_SF_rings_3relays']['success'].append(m)
-        scenarios['LoRa_SF_rings_3relays']['success_std'].append(s)
-        scenarios['LoRa_SF_rings_3relays']['goodput'].append(g)
-        scenarios['LoRa_SF_rings_3relays']['throughput'].append(t)
-        save_partial_results()
+    save_partial_results()
 
     elapsed = time.perf_counter() - start
     print(f'\nSimulation finished in {elapsed:.1f} s')
