@@ -12,15 +12,30 @@ class Fragment():
     For LR-FHSS fragments the LoRa-specific attributes (sf, bw, cr) are None.
     For conventional LoRa the fragment type is 'lora' and sf/bw/cr are set,
     enabling link-aware reception checks in Base.finish_fragment().
+
+    Attributes
+    ----------
+    grid_id : int or None
+        The grid index (0 .. num_grids-1) this fragment belongs to.
+        Set for LR-FHSS fragments; None for LoRa.
+    grid_channel : int or None
+        The within-grid channel index (0 .. channels_per_grid-1).
+        Set for LR-FHSS fragments; None for LoRa.
+    channel : int
+        Global channel index used for collision tracking.  For LR-FHSS
+        this is ``grid_id + grid_channel * num_grids``.
     """
     def __init__(self, type, duration, channel, packet, intensity,
-                 sf=None, bw=None, cr=None):
+                 sf=None, bw=None, cr=None, *, link_config=None,
+                 grid_id=None, grid_channel=None):
         self.packet = packet
         self.duration = duration
         self.success = 0
         self.transmitted = 0
         self.type = type          # 'header', 'payload', or 'lora'
         self.channel = channel
+        self.grid_id = grid_id
+        self.grid_channel = grid_channel
         self.timestamp = 0
         self.id = id(self)
         self.collided = []
@@ -29,6 +44,14 @@ class Fragment():
         self.sf = sf
         self.bw = bw
         self.cr = cr
+        # Link configuration reference (optional)
+        self.link_config = link_config
+        # Reception context — set by Node.transmit() before finish_fragment()
+        self.pathloss_model = (getattr(link_config, 'pathloss_model', None)
+                               if link_config is not None else None)
+        self.rx_distance = None
+        self.tx_power = None
+        self.rssi = None
 
 class Packet():
     """Represents a transmission from a node.
@@ -60,6 +83,7 @@ class Packet():
         self.success = 0
         self.fragments = []
         self.threshold = None  # per-packet decode threshold
+        self.link_config = link_config  # store for reference
 
         if link_config is not None:
             self.link_type = link_config.link_type
@@ -70,7 +94,8 @@ class Packet():
                 self._build_lrfhss(
                     link_config.obw, link_config.headers,
                     link_config.payloads, link_config.header_duration,
-                    link_config.payload_duration, fading_generator)
+                    link_config.payload_duration, fading_generator,
+                    link_config)
         else:
             # Legacy path – always LR-FHSS
             self.link_type = 'lrfhss'
@@ -79,19 +104,56 @@ class Packet():
                                fading_generator)
 
     def _build_lrfhss(self, obw, headers, payloads, header_duration,
-                      payload_duration, fading_generator):
-        """Create frequency-hopping header + payload fragments."""
-        self.channels = random.choices(range(obw), k=headers + payloads)
+                      payload_duration, fading_generator,
+                      link_config=None):
+        """Create frequency-hopping header + payload fragments.
+
+        Channel selection follows the LR-FHSS grid model:
+
+        1. The device randomly selects one of ``num_grids`` independent
+           grids (e.g. 52 grids for a 1.523 MHz OCW).
+        2. Each fragment hops to a random channel **within that grid**
+           (e.g. one of 60 channels spaced 25.4 kHz apart).
+        3. The global channel index used for collision tracking is::
+
+               global_ch = grid_id + grid_channel * num_grids
+
+        When ``link_config`` carries the grid parameters they are used
+        directly.  Otherwise (legacy path) the old flat-pool behaviour
+        is preserved with a single grid of *obw* channels.
+        """
+        # Resolve grid parameters from link_config or fall back to legacy
+        num_grids = getattr(link_config, 'num_grids', 1) if link_config else 1
+        channels_per_grid = (getattr(link_config, 'channels_per_grid', obw)
+                             if link_config else obw)
+
+        # Step 1: pick a random grid for the whole packet
+        self.grid_id = random.randrange(num_grids)
+
+        total_frags = headers + payloads
+        # Step 2: pick a random within-grid channel for each fragment
+        grid_channels = random.choices(range(channels_per_grid), k=total_frags)
+
+        # Step 3: map to global channel indices
+        self.channels = [self.grid_id + gc * num_grids
+                         for gc in grid_channels]
+
         for h in range(headers):
             intensity = fading_generator.fading_function()
             self.fragments.append(
                 Fragment('header', header_duration, self.channels[h],
-                         self.id, intensity))
+                         self.id, intensity, link_config=link_config,
+                         grid_id=self.grid_id,
+                         grid_channel=grid_channels[h]))
         for p in range(payloads):
+            idx = p + headers
             intensity = fading_generator.fading_function()
             self.fragments.append(
                 Fragment('payload', payload_duration,
-                         self.channels[p + h + 1], self.id, intensity))
+                         self.channels[idx], self.id, intensity,
+                         link_config=link_config,
+                         grid_id=self.grid_id,
+                         grid_channel=grid_channels[idx]))
 
     def _build_lora(self, link_config, fading_generator):
         """Create a single LoRa fragment spanning the full airtime."""
@@ -102,7 +164,7 @@ class Packet():
             Fragment('lora', link_config.time_on_air, channel,
                      self.id, intensity,
                      sf=link_config.sf, bw=link_config.bw,
-                     cr=link_config.cr))
+                     cr=link_config.cr, link_config=link_config))
 
     def next(self):
         self.index_transmission+=1
@@ -121,16 +183,21 @@ class Packet():
         """
         c = object.__new__(Packet)
         c.id = self.id
+        c.link_config = self.link_config
         c.node_id = self.node_id
         c.index_transmission = 0
         c.success = 0
         c.link_type = self.link_type
         c.threshold = self.threshold
         c.channels = list(self.channels)
+        c.grid_id = getattr(self, 'grid_id', None)
         c.fragments = []
         for f in self.fragments:
             cf = Fragment(f.type, f.duration, f.channel, c.id,
-                         f.intensity, sf=f.sf, bw=f.bw, cr=f.cr)
+                         f.intensity, sf=f.sf, bw=f.bw, cr=f.cr,
+                         link_config=f.link_config,
+                         grid_id=f.grid_id,
+                         grid_channel=f.grid_channel)
             c.fragments.append(cf)
         return c
 
@@ -343,11 +410,11 @@ class Node():
             self.transmitted += 1
 
             # Per-receiver independent packet clones
-            rx_packets = {}
-            for rx in receivers:
+            tx_packet_clones = {}
+            for packet_receiver in receivers:
                 clone = self.packet.clone()
-                rx.add_packet(clone)
-                rx_packets[rx] = clone
+                packet_receiver.add_packet(clone)
+                tx_packet_clones[packet_receiver] = clone
 
             first_payload = False
             for frag_idx, master_frag in enumerate(
@@ -357,38 +424,36 @@ class Node():
                     yield env.timeout(self.transceiver_wait)
 
                 # -- fragment start: register at each active receiver --
-                for rx in receivers:
-                    if getattr(rx, '_is_transmitting', False):
+                for packet_receiver in receivers:
+                    if getattr(packet_receiver, '_is_transmitting', False):
                         continue
-                    if not getattr(rx, '_is_listening', True):
+                    if not getattr(packet_receiver, '_is_listening', True):
                         continue
-                    rx_frag = rx_packets[rx].fragments[frag_idx]
-                    rx_frag.timestamp = env.now
+                    transmit_frag = tx_packet_clones[packet_receiver].fragments[frag_idx]
+                    transmit_frag.timestamp = env.now
                     # Store per-fragment reception context so the
                     # receiver can compute interferer RSSI later
                     # (needed for LoRa inter-SF interference model).
-                    rx_frag.rx_distance = self.distance_to(rx.x, rx.y)
-                    rx_frag.tx_power = self.transmission_power
-                    rx_frag._pathloss_model = self.pathloss_model
-                    rx.check_collision(rx_frag)
-                    rx.receive_packet(rx_frag)
+                    transmit_frag.rx_distance = self.distance_to(packet_receiver.x, packet_receiver.y)
+                    transmit_frag.tx_power = self.transmission_power
+                    if transmit_frag.pathloss_model is None:
+                        transmit_frag.pathloss_model = self.pathloss_model
+                    packet_receiver.mark_collisions(transmit_frag)
+                    packet_receiver.receive_packet(transmit_frag)
 
                 yield env.timeout(master_frag.duration)
 
                 # -- fragment end: finalize at each active receiver ----
-                for rx in receivers:
-                    if getattr(rx, '_is_transmitting', False):
+                for packet_receiver in receivers:
+                    if getattr(packet_receiver, '_is_transmitting', False):
                         continue
-                    if not getattr(rx, '_is_listening', True):
+                    if not getattr(packet_receiver, '_is_listening', True):
                         continue
-                    rx_frag = rx_packets[rx].fragments[frag_idx]
-                    dist = self.distance_to(rx.x, rx.y)
-                    rx.finish_fragment(rx_frag, dist,
-                                       self.transmission_power,
-                                       self.pathloss_model)
-                    rx_pkt = rx_packets[rx]
-                    if rx_pkt.success == 0:
-                        rx.try_decode(rx_pkt, env.now)
+                    transmit_frag = tx_packet_clones[packet_receiver].fragments[frag_idx]
+                    packet_receiver.finish_fragment(transmit_frag)
+                    tx_pkt = tx_packet_clones[packet_receiver]
+                    if tx_pkt.success == 0:
+                        packet_receiver.try_decode(tx_pkt, env.now)
 
             self.end_of_transmission()
 
@@ -432,13 +497,13 @@ class Base():
         self.id = id(self)
         self.obw = obw
         self.lora_channels = lora_channels
-        self.transmitting = {}
+        self.receiving = {}
         # LR-FHSS channels: 0 .. obw-1
         for channel in range(obw):
-            self.transmitting[channel] = []
+            self.receiving[channel] = []
         # LoRa channels: obw .. obw+lora_channels-1
         for channel in range(obw, obw + lora_channels):
-            self.transmitting[channel] = []
+            self.receiving[channel] = []
         self.packets_received = {}
         self.decoded_packets = set()  # Track decoded packet keys (dedup)
         self.threshold = threshold
@@ -461,7 +526,9 @@ class Base():
         """
         if hasattr(fragment, 'rssi') and fragment.rssi is not None:
             return fragment.rssi
-        pathloss_model = getattr(fragment, '_pathloss_model', None)
+        pathloss_model = getattr(fragment, 'pathloss_model', None)
+        if pathloss_model is None and getattr(fragment, 'link_config', None) is not None:
+            pathloss_model = getattr(fragment.link_config, 'pathloss_model', None)
         if pathloss_model is None:
             # Fall back: use distance^2 free-space approximation
             pl = 20.0 * math.log10(max(distance, 1.0)) + 40.0
@@ -481,17 +548,20 @@ class Base():
 
     def receive_packet(self, fragment):
         # Lazily create channel bucket if it doesn't exist yet
-        if fragment.channel not in self.transmitting:
-            self.transmitting[fragment.channel] = []
-        self.transmitting[fragment.channel].append(fragment)
+        if fragment.channel not in self.receiving:
+            self.receiving[fragment.channel] = []
+        self.receiving[fragment.channel].append(fragment)
 
-    def finish_fragment(self, fragment, distance, transmission_power,
-                        pathloss_model=None):
+    def finish_fragment(self, fragment):
         """Mark a fragment as finished and determine success.
 
+        The fragment carries its reception context (``rx_distance``,
+        ``tx_power``, ``pathloss_model``) set by :meth:`Node.transmit`,
+        so no extra parameters are needed.
+
         For LR-FHSS and LoRa fragments alike, the path loss is evaluated
-        via *pathloss_model* (a :class:`PathLoss` instance).  Both link
-        types now work entirely in the **dB domain**:
+        via the fragment's pathloss model.  Both link types work entirely
+        in the **dB domain**:
 
         .. code-block:: text
 
@@ -508,21 +578,17 @@ class Base():
         Parameters
         ----------
         fragment : Fragment
-        distance : float
-            Transmitter–receiver distance in metres.
-        transmission_power : float
-            Transmit power in dBm.
-        pathloss_model : PathLoss or None
-            Path-loss model to use.  If *None* a :class:`ValueError` is
-            raised — every link must carry a pathloss_model.
         """
         # Safety: fragment may have been cleared by half-duplex cancel
-        ch_list = self.transmitting.get(fragment.channel, [])
+        ch_list = self.receiving.get(fragment.channel, [])
         if fragment not in ch_list:
             fragment.transmitted = 1
             return
 
-        if pathloss_model is None:
+        # Resolve pathloss_model from fragment or its link_config
+        if fragment.pathloss_model is None and getattr(fragment, 'link_config', None) is not None:
+            fragment.pathloss_model = getattr(fragment.link_config, 'pathloss_model', None)
+        if fragment.pathloss_model is None:
             raise ValueError(
                 "finish_fragment: pathloss_model is None.  "
                 "Set a PathLoss instance on your LinkConfig (or Node)."
@@ -531,42 +597,81 @@ class Base():
         ch_list.remove(fragment)
 
         if fragment.type == 'lora':
-            self._finish_lora_fragment(fragment, distance,
-                                       transmission_power, pathloss_model)
+            self._finish_lora_fragment(fragment)
         else:
-            self._finish_lrfhss_fragment(fragment, distance,
-                                          transmission_power, pathloss_model)
+            self._finish_lrfhss_fragment(fragment)
 
-    def _finish_lrfhss_fragment(self, fragment, distance, transmission_power,
-                                 pathloss_model):
-        """LR-FHSS fragment success check — fully in the dB domain.
+    def _finish_lrfhss_fragment(self, fragment):
+        """LR-FHSS fragment success check (dB domain).
 
         RSSI is computed as::
 
-            rssi = tx_power - path_loss_db(d) + 20·log10(intensity)
+            rssi = tx_power - path_loss_db(d) + 20 log10(fading intensity)
 
         and compared against the receiver sensitivity threshold.
+        When colliders are present, an SIR check is performed against
+        the aggregate interference power.
         """
-        path_loss = pathloss_model.path_loss_db(distance)
-        rssi = transmission_power - path_loss     # dBm
+        path_loss = fragment.pathloss_model.path_loss_db(fragment.rx_distance)
+        rssi = fragment.tx_power - path_loss     # dBm
 
         # Apply fading as a dB gain (intensity is a linear amplitude factor)
         if fragment.intensity > 0:
             rssi += 20.0 * math.log10(fragment.intensity)
 
-        if len(fragment.collided) == 0 and rssi > self.sensitivity:
+        # Sensitivity check
+        if rssi <= self.sensitivity:
+            fragment.transmitted = 1
+            return
+
+        # No collisions -> success
+        if len(fragment.collided) == 0:
             fragment.success = 1
+            fragment.transmitted = 1
+            return
+
+        # Sum interference power from all colliders on the same channel
+        total_interference_mw = 0.0
+        for collider in fragment.collided:
+            c_rssi = getattr(collider, 'rssi', None)
+            if c_rssi is None:
+                c_dist = getattr(collider, 'rx_distance', None)
+                c_txp = getattr(collider, 'tx_power', None)
+                c_pl_model = getattr(collider, 'pathloss_model', None)
+                if c_pl_model is None and getattr(collider, 'link_config', None) is not None:
+                    c_pl_model = getattr(collider.link_config, 'pathloss_model', None)
+                if c_dist is not None and c_txp is not None and c_pl_model is not None:
+                    c_rssi = c_txp - c_pl_model.path_loss_db(c_dist)
+                    if getattr(collider, 'intensity', 1) > 0:
+                        c_rssi += 20.0 * math.log10(collider.intensity)
+                    collider.rssi = c_rssi
+                else:
+                    # Cannot determine interferer strength -> assume fatal
+                    fragment.transmitted = 1
+                    return
+            total_interference_mw += 10.0 ** (c_rssi / 10.0)
+
+        if total_interference_mw > 0.0:
+            total_interference_dbm = 10.0 * math.log10(total_interference_mw)
+            sir_db = rssi - total_interference_dbm
+            if sir_db >= 8.0:
+                fragment.success = 1
+        else:
+            fragment.success = 1
+
         fragment.transmitted = 1
 
-    def _finish_lora_fragment(self, fragment, distance, transmission_power,
-                               pathloss_model):
-        """LoRa fragment success check — dB domain, per-SF sensitivity/SNR.
+    def _finish_lora_fragment(self, fragment):
+        """LoRa fragment success check  (dB domain), per-SF sensitivity/SNR.
 
         Uses the same path-loss model as LR-FHSS.  Additionally checks
         the minimum SNR requirement for the fragment's spreading factor.
+        Interference from all colliders is aggregated (linear domain)
+        and the SIR is compared against the non-orthogonal isolation
+        threshold using the strongest collider's SF.
         """
-        path_loss = pathloss_model.path_loss_db(distance)
-        rssi = transmission_power - path_loss     # dBm
+        path_loss = fragment.pathloss_model.path_loss_db(fragment.rx_distance)
+        rssi = fragment.tx_power - path_loss     # dBm
 
         # Apply fading as a dB gain (intensity is a linear amplitude factor)
         if fragment.intensity > 0:
@@ -584,10 +689,12 @@ class Base():
             fragment.transmitted = 1
             return
 
-        # --- Inter-SF interference check (Croce et al. 2018) ---
-        # For each collider on the same channel, compute the SIR and
-        # compare against the non-orthogonal isolation threshold.
+        # --- Aggregate interference check (Croce et al. 2018) ---
         survived = True
+        total_interference_mw = 0.0
+        strongest_collider_sf = None
+        strongest_collider_rssi = -float('inf')
+
         for collider in fragment.collided:
             if collider.type != 'lora':
                 # LR-FHSS collider on same channel -> treat as fatal
@@ -605,22 +712,32 @@ class Base():
                     # Cannot determine interferer strength -> assume fatal
                     survived = False
                     break
-            sir_db = rssi - c_rssi  # dB
-            threshold = lora_non_orth_delta(fragment.sf, collider.sf)
-            if sir_db < threshold:
-                survived = False
-                break
+            # Accumulate interference power (linear domain)
+            total_interference_mw += 10.0 ** (c_rssi / 10.0)
+            # Track the strongest interferer's SF for the threshold lookup
+            if c_rssi > strongest_collider_rssi:
+                strongest_collider_rssi = c_rssi
+                strongest_collider_sf = collider.sf
+
+        if survived and total_interference_mw > 0.0:
+            total_interference_dbm = 10.0 * math.log10(total_interference_mw)
+            sir_db = rssi - total_interference_dbm  # dB
+            # Use the SF of the strongest interferer for the isolation threshold
+            if strongest_collider_sf is not None:
+                threshold = lora_non_orth_delta(fragment.sf, strongest_collider_sf)
+                if sir_db < threshold:
+                    survived = False
 
         if survived:
             fragment.success = 1
         fragment.transmitted = 1
 
-    def check_collision(self, fragment):
+    def mark_collisions(self, fragment):
         """Mark mutual collisions between fragment and anything on the
-        same channel currently being transmitted."""
-        if fragment.channel not in self.transmitting:
+        same channel currently being received."""
+        if fragment.channel not in self.receiving:
             return
-        for f in self.transmitting[fragment.channel]:
+        for f in self.receiving[fragment.channel]:
             f.collided.append(fragment)
             fragment.collided.append(f)
 
@@ -773,8 +890,8 @@ class Relay(Base):
         received are lost.  ``Base.finish_fragment`` will detect the
         missing fragment and mark it as failed.
         """
-        for ch in self.transmitting:
-            self.transmitting[ch].clear()
+        for ch in self.receiving:
+            self.receiving[ch].clear()
 
     # -- forwarding process ---------------------------------------------
 
@@ -813,14 +930,16 @@ class Relay(Base):
                 first_payload = True
                 yield self.env.timeout(tw)
             frag.timestamp = self.env.now
-            self.sink.check_collision(frag)
+            # Set per-fragment reception context for the relay→sink hop
+            frag.rx_distance = dist_to_sink
+            frag.tx_power = self.transmission_power
+            if frag.pathloss_model is None:
+                frag.pathloss_model = getattr(self.forward_link_config,
+                                              'pathloss_model', None)
+            self.sink.mark_collisions(frag)
             self.sink.receive_packet(frag)
             yield self.env.timeout(frag.duration)
-            fwd_pathloss = getattr(self.forward_link_config,
-                                   'pathloss_model', None)
-            self.sink.finish_fragment(frag, dist_to_sink,
-                                     self.transmission_power,
-                                     fwd_pathloss)
+            self.sink.finish_fragment(frag)
             if fwd.success == 0:
                 self.sink.try_decode(fwd, self.env.now)
 

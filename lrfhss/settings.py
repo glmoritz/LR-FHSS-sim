@@ -61,7 +61,7 @@ class Settings():
                  code='1/3',
                  traffic_class=Exponential_Traffic,
                  traffic_param={'average_interval': 900},
-                 transceiver_wait=0.006472, obw=35, base='core',
+                 transceiver_wait=0.006472, obw=None, base='core',
                  window_size=2, window_step=0.5, sensitivity=-120,
                  fading_class=No_Fading,
                  min_distance=0, max_distance=2250,
@@ -76,6 +76,10 @@ class Settings():
                  relay_dutycycle_period_s=None,
                  relay_dutycycle_percent=None,
                  lora_channels=8,
+                 # LR-FHSS channel / grid parameters
+                 ocw_hz=1_523_000,
+                 obw_hz=488,
+                 grid_spacing_hz=25_400,
                  # legacy shims — kept for backward compat
                  gamma=2.32, d0=1000.0, lpld0=128.95, std=7.8,
                  base_position=(0, 0)):
@@ -145,6 +149,9 @@ class Settings():
                     obw=obw,
                     payloads=payloads,
                     threshold=threshold,
+                    ocw_hz=ocw_hz,
+                    obw_hz=obw_hz,
+                    grid_spacing_hz=grid_spacing_hz,
                 )
             else:
                 _default_lc = link_config
@@ -167,6 +174,9 @@ class Settings():
                 obw=obw,
                 payloads=payloads,
                 threshold=threshold,
+                ocw_hz=ocw_hz,
+                obw_hz=obw_hz,
+                grid_spacing_hz=grid_spacing_hz,
             )
             self.link_config = _default_lc
 

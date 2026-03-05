@@ -1,5 +1,7 @@
 # %%
 
+from matplotlib.offsetbox import DEBUG
+
 from lrfhss.run import *
 import time
 from joblib import Parallel, delayed
@@ -16,8 +18,8 @@ from lrfhss.pathloss import LogDistance_PathLoss
 # Simulation parameters
 # =====================================================================
 nNodes_points = 10                    # Number of node-count sweep points.
-nNodes_min = 1000                     # Minimum total number of nodes.
-nNodes_max = 10000                    # Maximum total number of nodes.
+nNodes_min = 10000                     # Minimum total number of nodes.
+nNodes_max = 100000                    # Maximum total number of nodes.
 nNodes = np.linspace(nNodes_min, nNodes_max, nNodes_points, dtype=int)
 
 loops = 100                           # Monte-Carlo repetitions per point.
@@ -91,7 +93,7 @@ def lora_sf_by_distance(distance):
 lrfhss_link_config = LinkConfig(
     link_type='lrfhss',               # 'lrfhss' or 'lora'.
     payload_size=20,                   # Application payload size (bytes).
-    sensitivity=-120.0,                # Receiver sensitivity (dBm).
+    sensitivity=-137.0,                # Receiver sensitivity (dBm).
     transmission_power=14.0,           # Device transmit power (dBm).
     pathloss_model=pathloss_model,     # Log-distance path-loss model.
     headers=3,                         # Number of header replicas.
@@ -99,7 +101,10 @@ lrfhss_link_config = LinkConfig(
     payload_duration=0.1024,           # Duration of one payload fragment (s).
     transceiver_wait=0.006472,         # Radio turnaround / wait time (s).
     code='1/3',                        # Coding rate.
-    obw=35,                            # Occupied bandwidth (kHz).
+    ocw_hz=1_523_000,                  # Occupied Channel Width (Hz) - 1.523 MHz.
+    obw_hz=488,                        # Occupied Bandwidth per sub-channel (Hz).
+    grid_spacing_hz=25_400,            # Minimum hop spacing (Hz) - 25.4 kHz.
+    # Grid structure: 3120 total channels, 52 grids, 60 channels/grid.
     payloads=None,                     # Payload fragments (None = auto).
     threshold=None,                    # Decode threshold  (None = auto).
 )
@@ -127,11 +132,10 @@ settings_template = {
     'traffic_class': Exponential_Traffic,  # Traffic generator class.
     'traffic_param': {'average_interval': 900},  # Traffic params.
     'transceiver_wait': 0.006472,      # Radio turnaround / wait time (s).
-    'obw': 35,                         # Occupied bandwidth (kHz).
     'base': 'core',                    # Base station decoder.
     'window_size': 2,                  # Sliding window size.
     'window_step': 0.5,                # Sliding window step (s).
-    'sensitivity': -120,               # Receiver sensitivity (dBm).
+    'sensitivity': -137,               # Receiver sensitivity (dBm).
     'fading_class': Rayleigh_Fading,   # Channel fading model class.
     'min_distance': 0,                 # Minimum node distance (m).
     'max_distance': max_radius,        # Maximum node distance (m).
@@ -161,6 +165,7 @@ settings_template = {
 # link_cfg can be a LinkConfig instance OR a callable(distance)->LinkConfig
 # =====================================================================
 def run_scenario(n_total, link_cfg, number_relays=0, relay_pos=None):
+    DEBUG = False
     """Run *loops* Monte-Carlo repetitions and return
     (mean_success, std_success, mean_goodput, mean_tx)."""
     s_dict = settings_template.copy()
@@ -170,9 +175,13 @@ def run_scenario(n_total, link_cfg, number_relays=0, relay_pos=None):
     s_dict['relay_positions'] = relay_pos
     s = Settings(**s_dict)
 
-    results = Parallel(n_jobs=jobs)(
-        delayed(run_sim)(s, seed=seed) for seed in range(loops)
-    )
+    if DEBUG:
+        results = [run_sim(s, seed=1)]  # single run for quick testing
+    else:    
+        results = Parallel(n_jobs=jobs)(
+            delayed(run_sim)(s, seed=seed) for seed in range(loops)
+        )
+        
     successes = [r[0][0] for r in results if r != 1]
     goodputs  = [r[1][0] for r in results if r != 1]
     txs       = [r[2][0] for r in results if r != 1]

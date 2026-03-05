@@ -212,7 +212,34 @@ class LinkConfig:
 
     LR-FHSS specific (ignored when link_type='lora'):
         headers, header_duration, payload_duration, transceiver_wait,
-        code, obw, payloads, threshold.
+        code, payloads, threshold.
+
+    LR-FHSS channel / grid parameters:
+        ocw_hz : float
+            Occupied Channel Width in Hz.  This is the total RF bandwidth
+            allocated to LR-FHSS (default 1_523_000 Hz = 1.523 MHz, the
+            US/FCC 915 MHz band allocation).
+        obw_hz : float
+            Occupied Bandwidth of a single sub-channel in Hz (default
+            488 Hz, fixed by the LR-FHSS standard).
+        grid_spacing_hz : float
+            Minimum frequency separation between two consecutive hops
+            within the same grid (default 25_400 Hz = 25.4 kHz).  This
+            regulatory constraint determines the grid structure.
+
+        Derived (computed automatically):
+            total_channels : int
+                ``ocw_hz / obw_hz`` (e.g. 3 120).
+            num_grids : int
+                ``grid_spacing_hz / obw_hz`` (e.g. 52).
+            channels_per_grid : int
+                ``total_channels / num_grids`` (e.g. 60).
+
+        obw : int  (deprecated / backward-compatible)
+            If set explicitly **and** none of ocw_hz/obw_hz/grid_spacing_hz
+            are provided, the legacy single-grid mode is used with *obw*
+            channels.  Otherwise it is overridden by the grid-based
+            computation.
 
     LoRa specific (ignored when link_type='lrfhss'):
         sf, bw, cr, lora_channels.
@@ -243,9 +270,13 @@ class LinkConfig:
         payload_duration: float = 0.1024,
         transceiver_wait: float = 0.006472,
         code: str = '1/3',
-        obw: int = 35,
+        obw: int = None,
         payloads: int = None,
         threshold: int = None,
+        # --- LR-FHSS channel / grid parameters ---
+        ocw_hz: float = 1_523_000,
+        obw_hz: float = 488,
+        grid_spacing_hz: float = 25_400,
         # --- LoRa specific ---
         sf: int = 9,
         bw: int = 125,
@@ -265,19 +296,45 @@ class LinkConfig:
         if self.link_type == 'lrfhss':
             self._init_lrfhss(headers, header_duration, payload_duration,
                               transceiver_wait, code, obw, payloads, threshold,
-                              payload_size)
+                              payload_size, ocw_hz, obw_hz, grid_spacing_hz)
         else:
             self._init_lora(sf, bw, cr, lora_channels, payload_size)
 
     # ---- LR-FHSS initialisation ----
     def _init_lrfhss(self, headers, header_duration, payload_duration,
                      transceiver_wait, code, obw, payloads, threshold,
-                     payload_size):
+                     payload_size, ocw_hz, obw_hz, grid_spacing_hz):
         self.headers = headers
         self.header_duration = header_duration
         self.payload_duration = payload_duration
         self.transceiver_wait = transceiver_wait
-        self.obw = obw
+
+        # ---- OCW / OBW / Grid channel structure ----
+        self.ocw_hz = ocw_hz
+        self.obw_hz = obw_hz
+        self.grid_spacing_hz = grid_spacing_hz
+
+        # Derived grid parameters
+        self.total_channels = int(ocw_hz / obw_hz)          # e.g. 3120
+        self.num_grids = int(grid_spacing_hz / obw_hz)      # e.g. 52
+        self.channels_per_grid = int(self.total_channels     # e.g. 60
+                                     / self.num_grids)
+
+        if obw is not None:
+            # Legacy single-grid mode: caller explicitly passed a
+            # channel count.  Treat it as a flat pool with one grid.
+            warnings.warn(
+                "LinkConfig: 'obw' is deprecated for LR-FHSS.  Use "
+                "'ocw_hz', 'obw_hz', and 'grid_spacing_hz' instead.  "
+                "Falling back to legacy single-grid mode.",
+                DeprecationWarning, stacklevel=3,
+            )
+            self.total_channels = obw
+            self.num_grids = 1
+            self.channels_per_grid = obw
+
+        # obw exposed for Base channel allocation (= total channel pool)
+        self.obw = self.total_channels
 
         if payloads is not None:
             self.payloads = payloads
@@ -353,7 +410,12 @@ class LinkConfig:
         if self.link_type == 'lrfhss':
             return (f"LinkConfig(type=lrfhss, headers={self.headers}, "
                     f"payloads={self.payloads}, threshold={self.threshold}, "
-                    f"obw={self.obw}, ToA={self.time_on_air:.4f}s)")
+                    f"OCW={self.ocw_hz/1e6:.3f}MHz, "
+                    f"OBW={self.obw_hz}Hz, "
+                    f"grids={self.num_grids}, "
+                    f"ch/grid={self.channels_per_grid}, "
+                    f"total_ch={self.total_channels}, "
+                    f"ToA={self.time_on_air:.4f}s)")
         else:
             return (f"LinkConfig(type=lora, SF={self.sf}, BW={self.bw}kHz, "
                     f"CR=4/{self.cr+4}, channels={self.lora_channels}, "
